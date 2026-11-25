@@ -33,6 +33,7 @@ use crate::road::{Point, RoadNetwork, RoadSpec};
 use crate::rng::Pcg32;
 use crate::terrain::Terrain;
 use crate::time::{Calendar, Tick};
+use crate::worldgen::{WorldGen, WorldGenParams};
 use crate::zoning::{ZoneType, Zoning};
 
 /// Toute la configuration du cœur de simulation, en un seul objet.
@@ -197,6 +198,10 @@ pub struct World {
     rng: Pcg32,
 
     terrain: Terrain,
+    /// Générateur du relief, si la carte en vient : il prolonge le terrain
+    /// au-delà de la zone jouable (décor jusqu'à l'horizon). `None` pour un
+    /// terrain fourni à la main (tests, scénarios plats).
+    worldgen: Option<WorldGen>,
     zoning: Zoning,
     roads: RoadNetwork,
     road_access: Vec<bool>,
@@ -270,6 +275,7 @@ impl World {
             calendar,
             rng: Pcg32::new(seed, 0),
             terrain,
+            worldgen: None,
             zoning,
             roads: RoadNetwork::new(),
             road_access,
@@ -289,6 +295,26 @@ impl World {
     }
 
     // ----------------------------------------------------------------- accès
+
+    /// Monde dont le relief est généré : la zone jouable `width × height`
+    /// tuiles est un échantillonnage de `WorldGen`, qui reste disponible pour
+    /// prolonger le paysage au-delà (`World::worldgen`).
+    #[must_use]
+    pub fn generated(config: SimConfig, seed: u64, params: WorldGenParams, width: u32, height: u32) -> Self {
+        let tile = config.tile_size_m;
+        let generator = WorldGen::new(params, i64::from(width) * i64::from(tile), i64::from(height) * i64::from(tile));
+        let terrain = generator
+            .terrain(width.max(1), height.max(1), tile)
+            .unwrap_or_else(|_| Terrain::flat(width.max(1), height.max(1)));
+        let mut world = Self::new(config, seed, terrain);
+        world.worldgen = Some(generator);
+        world
+    }
+
+    #[must_use]
+    pub const fn worldgen(&self) -> Option<&WorldGen> {
+        self.worldgen.as_ref()
+    }
 
     #[must_use]
     pub const fn current_tick(&self) -> Tick {
