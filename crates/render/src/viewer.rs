@@ -24,51 +24,9 @@ use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::render::mesh::{Indices, Mesh, PrimitiveTopology};
 
-use sim_core::{
-    tile_center_m, Command, FixedStepClock, Point, Rect, RoadSpec, SimConfig, Terrain, World,
-    ZoneType,
-};
+use sim_core::{FixedStepClock, World};
 
 use crate::scene;
-
-/// Construit un monde de démonstration : un maillage de rues, une avenue
-/// courbe pour montrer les splines, et un zonage mixte qui produit une ville
-/// lisible en quelques secondes.
-#[must_use]
-pub fn demo_city() -> World {
-    let mut world = World::new(SimConfig::default(), 0x0C17_CAFE, Terrain::flat(128, 128));
-    for row in 0..10i32 {
-        let y = 16 + row * 10;
-        world.queue(Command::BuildRoad {
-            from: Point::new(tile_center_m(8), tile_center_m(y)),
-            to: Point::new(tile_center_m(120), tile_center_m(y)),
-            spec: RoadSpec::AVENUE,
-        });
-        for (band, zone) in [
-            (y + 1, ZoneType::Residential),
-            (y + 2, ZoneType::Residential),
-            (y + 3, ZoneType::Residential),
-            (y - 1, ZoneType::Commercial),
-            (y - 2, ZoneType::Industrial),
-            (y - 3, ZoneType::Industrial),
-        ] {
-            world.queue(Command::ZoneRect {
-                rect: Rect::new(8, band as u32, 120, band as u32),
-                zone,
-            });
-        }
-    }
-    // Boulevard courbe (les poignées sont les tangentes d'extrémité) reliant
-    // la ville basse au parc : c'est le test visuel des splines.
-    world.queue(Command::BuildCurve {
-        from: Point::new(tile_center_m(8), tile_center_m(16)),
-        to: Point::new(tile_center_m(8), tile_center_m(106)),
-        from_handle: Point::new(sim_core::Fixed::from_int(70), sim_core::Fixed::from_int(-10)),
-        to_handle: Point::new(sim_core::Fixed::from_int(-70), sim_core::Fixed::from_int(10)),
-        spec: RoadSpec::TWO_WAY,
-    });
-    world
-}
 
 /// Lancée par le binaire `city-viewer`.
 pub fn run() {
@@ -81,7 +39,7 @@ pub fn run() {
             }),
             ..default()
         }))
-        .insert_resource(Sim::new(demo_city()))
+        .insert_resource(Sim::new(scene::demo_city()))
         .insert_resource(Handles::default())
         // `ScreenshotPlugin` est déjà fourni par `DefaultPlugins` en Bevy 0.20.
         .add_systems(Startup, setup)
