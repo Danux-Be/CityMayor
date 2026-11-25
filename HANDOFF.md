@@ -7,7 +7,7 @@
 > **Prompt de reprise pour Claude Code :**
 > « Tu reprends le projet Rust CityMayor dans `/home/dany/HDD1/CityMayor`. Lis
 > `HANDOFF.md` en entier, puis `README.md`. Objectif immédiat : itération 2b.
-> Commence par `cargo test --workspace` (95 tests doivent passer) et
+> Commence par `cargo test --workspace` (102 tests doivent passer) et
 > `cargo clippy --workspace --all-targets` (muet). Ne casse aucun invariant de la
 > section 4. Avance par petits commits logiques ; demande avant tout choix qui
 > contredit la section 2. »
@@ -35,7 +35,7 @@ sauvegarde. Le viewer est un squelette visuel, pas encore un jeu.
 
 Chiffres vérifiés au moment de la passation :
 
-- **95 tests** : 71 unitaires `sim-core`, 19 d'intégration `sim-core`, 5 `city-render` ;
+- **102 tests** : 75 unitaires `sim-core`, 21 d'intégration `sim-core`, 6 `city-render` ;
 - `cargo clippy --workspace --all-targets` : **0 warning** ;
 - démo headless à 640 ticks : 2 528 habitants (capacité saturée), 735 emplois,
   114 bâtiments, 2 segments, ~101 500 $ ;
@@ -124,7 +124,10 @@ Bevy disparaît, `sim-core` + `citymayor` doivent continuer à tourner.
    revoir `built_tile_to_id` dans les tests, `Buildings::household_pos`, et
    `SimEvent::BuildingBuilt`.
 7. **Un seul bâtiment par tuile.** `spawn` sur une tuile occupée renvoie `None`.
-8. **`occupants <= capacity` toujours.** Le census et les tests d'intégration le
+8. **Les occupants ne changent que via `Buildings::set_occupants`** (pas
+   d'accès `&mut Building` public) : c'est ce qui garde `BuildingTotals`
+   juste. Test : `incremental_totals_match_a_full_recount`.
+   **`occupants <= capacity` toujours.** Le census et les tests d'intégration le
    vérifient.
 9. **Les ids ne sont jamais réutilisés** : segments en tombstone (`Option`),
    bâtiments libérés par slot mais ids stables par tuile.
@@ -150,9 +153,9 @@ Bevy disparaît, `sim-core` + `citymayor` doivent continuer à tourner.
 apply_commands          FIFO, validation, événements de refus
 refresh_road_access     seulement si topologie modifiée (Bresenham sur courbe)
 land_value              budget de tuiles, curseur persistant
-move_population         slab compact des logements, flux entrant/sortant
-grow                    quota composé par zone, tuiles desservies + pente
-census                  un passage, bonheur EMA
+move_population         slab compact des logements, inspection bornée par le budget
+grow                    quota composé par zone, listes de tuiles candidates
+census                  O(1) via BuildingTotals, bonheur EMA
 demand                  RCI (déterministe, sans bruit)
 budget                  si frontière de mois
 ```
@@ -307,7 +310,7 @@ cargo run -p citymayor-app --features viewer --bin city-viewer
 
 ### Cargo / workspace
 
-- Les stubs `sim-transport`, `sim-economy`, `render`, `ui` n'ont **pas** de
+- Les stubs `sim-transport`, `sim-economy`, `ui` n'ont **pas** de
   dépendance `sim-core` pour éviter les warnings `unused_dependencies` de Cargo
   1.100. Il faudra la rajouter au moment de les implémenter (et remettre les
   entrées dans `[workspace.dependencies]`, retirées pour la même raison).
@@ -318,13 +321,14 @@ cargo run -p citymayor-app --features viewer --bin city-viewer
 
 ### Itération 2b — viewer utilisable
 
-1. **Pré-simulation de la démo** : dans `viewer.rs::demo_city`, lancer
+1. **Pré-simulation de la démo** : dans `scene::demo_city`, lancer
    `for _ in 0..1500 { world.tick(); }` avant de retourner le monde, pour ouvrir
    sur une ville peuplée. (Tentative non appliquée lors de la passation : le
    fichier est resté avec la ville vide au démarrage.)
-2. **Vérifier le boulevard courbe** : le déplacer vers le centre de l'écran et
-   augmenter la courbure (poignées latérales de même signe) ; contrôler que la
-   desserte suit bien la courbe.
+2. ~~Boulevard courbe~~ : fait. Il passe par un nœud intermédiaire neuf
+   (`scene::demo_city`), car ses extrémités réutilisent des nœuds d'avenue dont
+   la poignée n'est pas modifiable (invariant 11). Test :
+   `demo_boulevard_is_actually_curved`.
 3. **Caméra souris** : orbite au clic-droit, pan au clic-milieu, zoom molette,
    amortissement (`lerp`), bornes de pitch et de distance.
 4. **Visuel** : ciel clair, brouillard léger, normales de terrain calculées
@@ -342,7 +346,7 @@ cargo run -p citymayor-app --features viewer --bin city-viewer
 
 **Critère de sortie 2b** : la fenêtre s'ouvre sur une ville peuplée, la caméra
 se pilote à la souris, on peut zoner et tracer une route courbe à la main, les
-overlays se basculent, et les 95 tests restent verts.
+overlays se basculent, et les 102 tests restent verts.
 
 ### Itération 3 — transport
 
