@@ -1,0 +1,11 @@
+[package]
+name = "city-ui"
+description = "HUD, overlays, build tools and command authoring. Emits sim commands, reads sim snapshots."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true

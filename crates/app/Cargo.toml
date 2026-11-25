@@ -1,0 +1,29 @@
+[package]
+name = "citymayor-app"
+description = "Host binary: owns the fixed-step loop and wires sim, render and UI together."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+default-run = "citymayor"
+
+[features]
+# `--features viewer` active le binaire Bevy (compilation longue, GPU requis).
+viewer = ["dep:city-render", "city-render/viewer"]
+
+[dependencies]
+sim-core = { workspace = true }
+city-render = { path = "../render", optional = true }
+
+[[bin]]
+name = "citymayor"
+path = "src/main.rs"
+
+[[bin]]
+name = "city-viewer"
+path = "src/bin/viewer.rs"
+required-features = ["viewer"]
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "sim-economy"
+description = "Micro-economy: companies, supply chains, land market, taxes and household budgets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true

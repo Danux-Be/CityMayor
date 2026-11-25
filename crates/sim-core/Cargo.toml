@@ -1,0 +1,15 @@
+[package]
+name = "sim-core"
+description = "Deterministic, data-oriented simulation core (terrain, zoning, roads, growth, census, budget)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Volontairement zéro dépendance : le cœur de simulation doit rester
+# auditable, reproductible et exempt de flottants non déterministes.
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,64 @@
+# CityMayor — workspace racine.
+#
+# Règle de dépendance (flèches uniquement vers le bas, jamais de cycle) :
+#
+#   app  ──────────────► sim-core, sim-transport, sim-economy
+#   ui   ──────────────► sim-core        (lecture seule des vues / snapshots)
+#   render ────────────► sim-core        (lecture seule, zéro tick)
+#   sim-transport ─────► sim-core
+#   sim-economy ───────► sim-core
+#   sim-core ──────────► (std uniquement : déterministe, testable, portable)
+#
+# Aucune crate de simulation ne dépend d'une crate de présentation, et l'inverse
+# n'est autorisé que via des *vues* immuables exposées par `sim-core`.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/app",
+    "crates/render",
+    "crates/sim-core",
+    "crates/sim-economy",
+    "crates/sim-transport",
+    "crates/ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["CityMayor contributors"]
+
+[workspace.dependencies]
+sim-core = { path = "crates/sim-core" }
+# `sim-transport` et `sim-economy` rejoindront cette table (avec `sim-core`
+# en dépendance) au moment de leur implémentation : les déclarer maintenant
+# produirait une dépendance non consommée, donc un warning de build.
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Conversions numériques explicites et voulues (grille <-> indices, fixed-point).
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+
+# Le simulateur tourne à tick fixe : on veut de la marge CPU pour la sim et le
+# rendu en debug, sans pour autant désactiver les assertions.
+[profile.dev]
+opt-level = 1
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
