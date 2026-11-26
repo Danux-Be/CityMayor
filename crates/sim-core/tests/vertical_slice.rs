@@ -696,7 +696,7 @@ fn roundabouts_are_closed_one_way_rings_that_streets_can_join() {
 
 #[test]
 fn building_works_go_through_every_stage_before_housing_anyone() {
-    use sim_core::{ConstructionStage, SimEvent};
+    use sim_core::SimEvent;
     let config = SimConfig { road_construction: false, ..SimConfig::default() };
     let mut world = World::new(config, 31, Terrain::flat(32, 32));
     world.queue(Command::BuildRoad {

@@ -1601,12 +1601,19 @@ mod tests {
             }
             previous_height = height;
         }
-        // Un immeuble en gros œuvre a sa grue (bien au-dessus du bâtiment).
-        let mut mesh = UrbanMesh::default();
-        push_building(&world, &mut mesh, &lot, tall, 48, ConstructionStage::Structure, 0.5);
-        let ground = ground_altitude_m(&world, lot.center[0], lot.center[1]);
-        let top = mesh.positions.iter().map(|p| p[1] - ground).fold(0.0, f32::max);
-        assert!(top > 25.0, "grue absente : {top} m");
+        // Certains immeubles en gros œuvre ont une grue (bien au-dessus du
+        // bâtiment), pas tous : une grue dessert plusieurs parcelles.
+        let lots: Vec<Lot> = world.buildings().iter().filter_map(|(_, b)| lot_for(&world, &roads, b.tile)).take(200).collect();
+        let cranes = lots
+            .iter()
+            .filter(|lot| {
+                let mut mesh = UrbanMesh::default();
+                push_building(&world, &mut mesh, lot, tall, 48, ConstructionStage::Structure, 0.5);
+                let ground = ground_altitude_m(&world, lot.center[0], lot.center[1]);
+                mesh.positions.iter().any(|p| p[1] - ground > 25.0)
+            })
+            .count();
+        assert!(cranes > 10 && cranes < 80, "{cranes} grues sur {} chantiers", lots.len());
     }
 
     #[test]
