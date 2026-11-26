@@ -74,7 +74,7 @@ pub use ids::{BuildingId, NodeId, SegmentId, TileId};
 pub use land_value::{LandValueLayer, LandValueParams};
 pub use metrics::{Overlay, Snapshot};
 pub use population::Census;
-pub use road::{EdgeRef, Point, RoadError, RoadNetwork, RoadSpec, RoadSegment};
+pub use road::{EdgeRef, Point, RoadClass, RoadError, RoadNetwork, RoadSegment, RoadSpec, Roundabout};
 pub use spline::BezierCubic;
 pub use rng::Pcg32;
 pub use terrain::Terrain;

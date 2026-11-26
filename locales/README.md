@@ -9,6 +9,7 @@ locales/
     simulation.ftl    zones, buildings, overlays, statistics, events
     errors.ftl        messages shown when an action is refused
     interface.ftl     window, HUD, tools
+    roads.ftl         road types, road works, roundabouts
   <code>/             a translation (BCP 47 code: fr, de, pt-BR…)
 ```
 

@@ -5,7 +5,7 @@
 //! choisie. C'est le seul pont entre `sim-core` et `city-i18n`.
 
 use city_i18n::{Arg, Localizer};
-use sim_core::{BuildingKind, CommandError, Overlay, SimEvent, ZoneType};
+use sim_core::{BuildingKind, CommandError, Overlay, RoadSpec, SimEvent, ZoneType};
 
 #[must_use]
 pub fn zone(loc: &Localizer, zone: ZoneType) -> String {
@@ -20,6 +20,11 @@ pub fn building_kind(loc: &Localizer, kind: BuildingKind) -> String {
 #[must_use]
 pub fn overlay(loc: &Localizer, overlay: Overlay) -> String {
     loc.text(overlay.message_key())
+}
+
+#[must_use]
+pub fn road_type(loc: &Localizer, spec: RoadSpec) -> String {
+    loc.text(spec.message_key())
 }
 
 #[must_use]
@@ -65,6 +70,8 @@ pub fn event(loc: &Localizer, event: &SimEvent, month: u32) -> Option<String> {
         SimEvent::CommandRejected { error } => {
             loc.format("error-command-rejected", &[("reason", Arg::from(command_error(loc, error)))])
         }
+        SimEvent::RoundaboutBuilt { .. } => loc.text("event-roundabout-built"),
+        SimEvent::RoadsOpened { count } => loc.format("event-roads-opened", &[("count", Arg::from(*count))]),
         #[allow(unreachable_patterns)]
         _ => return None,
     })
@@ -87,6 +94,8 @@ mod tests {
         keys.extend(Overlay::ALL.iter().map(|o| o.message_key()));
         keys.extend(RoadError::ALL.iter().map(RoadError::message_key));
         keys.push(CommandError::OutOfBounds.message_key());
+        keys.extend(RoadSpec::CATALOGUE.iter().map(|(key, _)| *key));
+        keys.push("road-custom");
         let missing: Vec<_> = keys.into_iter().filter(|k| !en.has(k)).collect();
         assert!(missing.is_empty(), "clés absentes de locales/en : {missing:?}");
     }

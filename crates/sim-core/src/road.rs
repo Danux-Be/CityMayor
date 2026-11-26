@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use crate::fixed::Fixed;
 use crate::ids::{NodeId, SegmentId};
 use crate::spline::BezierCubic;
+use crate::time::Tick;
 
 /// Point du plan en mètres (point fixe).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -67,6 +68,44 @@ impl Point {
     }
 }
 
+/// Famille de route : revêtement, profil en travers, desserte des parcelles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RoadClass {
+    /// Chemin gravillonné, sans trottoir.
+    Gravel,
+    /// Rue urbaine avec trottoirs.
+    Street,
+    /// Grande artère à 4 voies, trottoirs.
+    Avenue,
+    /// Artère à terre-plein central planté, trottoirs.
+    Boulevard,
+    /// Voie rapide : bandes d'arrêt d'urgence, glissières, **ne dessert pas**
+    /// les parcelles riveraines.
+    Highway,
+}
+
+impl RoadClass {
+    pub const ALL: [Self; 5] = [Self::Gravel, Self::Street, Self::Avenue, Self::Boulevard, Self::Highway];
+
+    /// Une parcelle riveraine est-elle desservie par cette route ?
+    #[must_use]
+    pub const fn serves_lots(self) -> bool {
+        !matches!(self, Self::Highway)
+    }
+
+    /// Durée du chantier : `(ticks fixes, ticks par mètre)`.
+    #[must_use]
+    pub const fn construction_ticks(self) -> (u64, u64) {
+        match self {
+            Self::Gravel => (120, 1),
+            Self::Street => (240, 3),
+            Self::Avenue => (360, 4),
+            Self::Boulevard => (420, 5),
+            Self::Highway => (600, 6),
+        }
+    }
+}
+
 /// Caractéristiques d'une voie.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoadSpec {
@@ -75,26 +114,63 @@ pub struct RoadSpec {
     /// Voies autorisées de `b` vers `a` (0 = sens unique).
     pub backward_lanes: u8,
     pub speed_kph: u16,
+    pub class: RoadClass,
 }
 
 impl RoadSpec {
-    pub const TWO_WAY: Self = Self {
-        forward_lanes: 1,
-        backward_lanes: 1,
-        speed_kph: 50,
-    };
+    /// Chemin gravillonné à double sens.
+    pub const GRAVEL: Self = Self { forward_lanes: 1, backward_lanes: 1, speed_kph: 30, class: RoadClass::Gravel };
+    /// Rue à double sens, une voie par sens.
+    pub const TWO_WAY: Self = Self { forward_lanes: 1, backward_lanes: 1, speed_kph: 50, class: RoadClass::Street };
+    /// Rue à sens unique, une voie.
+    pub const ONE_WAY_SINGLE: Self = Self { forward_lanes: 1, backward_lanes: 0, speed_kph: 50, class: RoadClass::Street };
+    /// Rue à sens unique, deux voies.
+    pub const ONE_WAY: Self = Self { forward_lanes: 2, backward_lanes: 0, speed_kph: 50, class: RoadClass::Street };
+    /// Avenue, deux voies par sens.
+    pub const AVENUE: Self = Self { forward_lanes: 2, backward_lanes: 2, speed_kph: 70, class: RoadClass::Avenue };
+    /// Boulevard à terre-plein, deux voies par sens.
+    pub const BOULEVARD: Self = Self { forward_lanes: 2, backward_lanes: 2, speed_kph: 70, class: RoadClass::Boulevard };
+    /// Grand boulevard à terre-plein, trois voies par sens.
+    pub const BOULEVARD_WIDE: Self = Self { forward_lanes: 3, backward_lanes: 3, speed_kph: 80, class: RoadClass::Boulevard };
+    /// Autoroute à chaussées séparées, deux voies par sens.
+    pub const HIGHWAY: Self = Self { forward_lanes: 2, backward_lanes: 2, speed_kph: 120, class: RoadClass::Highway };
+    /// Chaussée d'autoroute à sens unique, trois voies.
+    pub const HIGHWAY_ONE_WAY: Self = Self { forward_lanes: 3, backward_lanes: 0, speed_kph: 120, class: RoadClass::Highway };
+    /// Bretelle d'autoroute, une voie.
+    pub const HIGHWAY_RAMP: Self = Self { forward_lanes: 1, backward_lanes: 0, speed_kph: 70, class: RoadClass::Highway };
 
-    pub const AVENUE: Self = Self {
-        forward_lanes: 2,
-        backward_lanes: 2,
-        speed_kph: 70,
-    };
+    /// Types proposés au joueur, avec la clé de leur nom (`locales/*/roads.ftl`).
+    pub const CATALOGUE: [(&'static str, Self); 10] = [
+        ("road-gravel", Self::GRAVEL),
+        ("road-street", Self::TWO_WAY),
+        ("road-one-way-single", Self::ONE_WAY_SINGLE),
+        ("road-one-way", Self::ONE_WAY),
+        ("road-avenue", Self::AVENUE),
+        ("road-boulevard", Self::BOULEVARD),
+        ("road-boulevard-wide", Self::BOULEVARD_WIDE),
+        ("road-highway", Self::HIGHWAY),
+        ("road-highway-one-way", Self::HIGHWAY_ONE_WAY),
+        ("road-highway-ramp", Self::HIGHWAY_RAMP),
+    ];
 
-    pub const ONE_WAY: Self = Self {
-        forward_lanes: 2,
-        backward_lanes: 0,
-        speed_kph: 50,
-    };
+    /// Clé du nom de ce type de route (`road-custom` hors catalogue).
+    #[must_use]
+    pub fn message_key(self) -> &'static str {
+        Self::CATALOGUE.iter().find(|(_, spec)| *spec == self).map_or("road-custom", |(key, _)| key)
+    }
+
+    #[must_use]
+    pub const fn is_one_way(self) -> bool {
+        self.forward_lanes == 0 || self.backward_lanes == 0
+    }
+
+    /// Durée du chantier d'un segment de `length_m` mètres, en ticks.
+    #[must_use]
+    pub fn construction_ticks(self, length_m: Fixed) -> u64 {
+        let (base, per_m) = self.class.construction_ticks();
+        let lanes = u64::from(self.total_lanes().max(1));
+        base + per_m * lanes.div_ceil(2) * length_m.ceil_to_int().max(0) as u64
+    }
 
     #[must_use]
     pub const fn total_lanes(self) -> u8 {
@@ -134,6 +210,43 @@ pub struct RoadSegment {
     /// Longueur d'arc précalculée (mètres) : budget, trafic, coût de
     /// construction. Recalculée quand une poignée incidente change.
     pub length_m: Fixed,
+    /// Tick d'ouverture : avant, la route est un chantier (ni desserte ni
+    /// circulation). `Tick::ZERO` = ouverte dès sa création.
+    pub opens_at: Tick,
+    /// Géométrie imposée (anneau de rond-point) : les poignées des nœuds ne
+    /// la recalculent pas.
+    pub fixed_curve: bool,
+}
+
+impl RoadSegment {
+    /// Route ouverte à `now` (chantier terminé).
+    #[must_use]
+    pub fn is_open(&self, now: Tick) -> bool {
+        now >= self.opens_at
+    }
+
+    /// Avancement du chantier dans `[0, 1]` à `now`, d'après sa durée totale.
+    #[must_use]
+    pub fn construction_progress(&self, now: Tick) -> Fixed {
+        if self.is_open(now) {
+            return Fixed::ONE;
+        }
+        let total = self.spec.construction_ticks(self.length_m).max(1);
+        let remaining = self.opens_at.raw() - now.raw();
+        let done = total.saturating_sub(remaining);
+        Fixed::from_ratio(done.min(i32::MAX as u64) as i32, total.min(i32::MAX as u64) as i32).clamp01()
+    }
+}
+
+/// Rond-point : anneau de segments à sens unique autour d'un îlot central.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Roundabout {
+    pub center: Point,
+    /// Rayon de l'axe de l'anneau (m).
+    pub radius_m: Fixed,
+    /// Nœuds de l'anneau, dans le sens de circulation.
+    pub nodes: Vec<NodeId>,
+    pub spec: RoadSpec,
 }
 
 /// Arête orientée d'adjacence CSR.
@@ -211,6 +324,7 @@ pub struct RoadNetwork {
     offsets: Vec<u32>,
     edges: Vec<EdgeRef>,
     adjacency_stale: bool,
+    roundabouts: Vec<Roundabout>,
 }
 
 impl RoadNetwork {
@@ -244,6 +358,93 @@ impl RoadNetwork {
             .iter()
             .enumerate()
             .filter_map(|(i, s)| s.as_ref().map(|s| (SegmentId::new(i as u32), s)))
+    }
+
+    /// Ronds-points construits.
+    #[must_use]
+    pub fn roundabouts(&self) -> &[Roundabout] {
+        &self.roundabouts
+    }
+
+    /// Fixe le tick d'ouverture d'un segment (chantier).
+    pub fn set_opens_at(&mut self, id: SegmentId, opens_at: Tick) {
+        if let Some(Some(seg)) = self.segments.get_mut(id.index()) {
+            seg.opens_at = opens_at;
+        }
+    }
+
+    /// Plus proche ouverture à venir après `now` (chantiers en cours).
+    #[must_use]
+    pub fn next_opening(&self, now: Tick) -> Option<Tick> {
+        self.segments().map(|(_, s)| s.opens_at).filter(|t| *t > now).min()
+    }
+
+    /// Construit un rond-point de 8 nœuds autour de `center`.
+    ///
+    /// La géométrie est exacte en arithmétique entière : les nœuds sont aux
+    /// multiples de 45° (cos/sin ∈ {0, ±1, ±√2/2}) et chaque arc de 45° est
+    /// une cubique de Bézier de poignée `4/3·tan(π/16)·r`, l'approximation
+    /// standard du cercle (écart < 0,01 % du rayon). Le sens de circulation
+    /// est anti-horaire vu du ciel (circulation à droite). Les poignées sont
+    /// portées par les segments (`fixed_curve`), pas par les nœuds : une rue
+    /// qui aboutit sur l'anneau y arrive droite.
+    ///
+    /// # Errors
+    /// Spécification invalide, rayon trop petit.
+    pub fn add_roundabout(&mut self, center: Point, radius_m: Fixed, spec: RoadSpec) -> Result<Vec<SegmentId>, RoadError> {
+        spec.validate()?;
+        if radius_m < Fixed::from_int(6) {
+            return Err(RoadError::DegenerateLength);
+        }
+        // √2/2 et 4/3·tan(π/16) en Q16.16 (constantes, pas de flottant).
+        let half_sqrt2 = Fixed::from_raw(46_341);
+        let arc_handle = Fixed::from_raw(17_381);
+        // Directions unitaires aux 8 positions, sens anti-horaire vu du ciel
+        // (Y de la carte vers le sud) : angle décroissant.
+        let units: [(Fixed, Fixed); 8] = [
+            (Fixed::ONE, Fixed::ZERO),
+            (half_sqrt2, -half_sqrt2),
+            (Fixed::ZERO, -Fixed::ONE),
+            (-half_sqrt2, -half_sqrt2),
+            (-Fixed::ONE, Fixed::ZERO),
+            (-half_sqrt2, half_sqrt2),
+            (Fixed::ZERO, Fixed::ONE),
+            (half_sqrt2, half_sqrt2),
+        ];
+        let nodes: Vec<NodeId> = units
+            .iter()
+            .map(|(ux, uy)| self.add_node(Point::new(center.x + ux.mul(radius_m), center.y + uy.mul(radius_m))))
+            .collect();
+        let handle_len = arc_handle.mul(radius_m);
+        // Tangente dans le sens de marche au point d'angle θ décroissant : (uy, -ux).
+        let tangent = |i: usize| {
+            let (ux, uy) = units[i];
+            Point::new(uy.mul(handle_len), (-ux).mul(handle_len))
+        };
+        let mut segments = Vec::with_capacity(8);
+        for i in 0..8 {
+            let j = (i + 1) % 8;
+            let (a, b) = (nodes[i], nodes[j]);
+            let (pa, pb) = (self.nodes[a.index()].pos, self.nodes[b.index()].pos);
+            let curve = BezierCubic::from_handles(pa, tangent(i), pb, tangent(j));
+            segments.push(self.connect_curve(a, b, spec, curve)?);
+        }
+        self.roundabouts.push(Roundabout { center, radius_m, nodes, spec });
+        Ok(segments)
+    }
+
+    /// Segment à géométrie imposée (indépendante des poignées de nœuds).
+    ///
+    /// # Errors
+    /// Comme [`RoadNetwork::connect`].
+    pub fn connect_curve(&mut self, a: NodeId, b: NodeId, spec: RoadSpec, curve: BezierCubic) -> Result<SegmentId, RoadError> {
+        let id = self.connect(a, b, spec)?;
+        if let Some(Some(seg)) = self.segments.get_mut(id.index()) {
+            seg.curve = curve;
+            seg.length_m = curve.length();
+            seg.fixed_curve = true;
+        }
+        Ok(id)
     }
 
     pub fn nodes(&self) -> impl Iterator<Item = (NodeId, &RoadNode)> + '_ {
@@ -288,7 +489,7 @@ impl RoadNetwork {
             let Some(seg) = self.segments[index].as_ref() else {
                 continue;
             };
-            if seg.a != node && seg.b != node {
+            if (seg.a != node && seg.b != node) || seg.fixed_curve {
                 continue;
             }
             let (a, b) = (seg.a, seg.b);
@@ -348,6 +549,8 @@ impl RoadNetwork {
             spec,
             curve,
             length_m,
+            opens_at: Tick::ZERO,
+            fixed_curve: false,
         }));
         self.live_segments += 1;
         self.pair_index.insert(pair_key(a, b), id);
@@ -473,6 +676,7 @@ impl RoadNetwork {
         height: u32,
         radius_tiles: i32,
         tile_size_m: i32,
+        now: Tick,
     ) -> Vec<bool> {
         let mut access = vec![false; (width as usize) * (height as usize)];
         if radius_tiles < 0 || tile_size_m <= 0 {
@@ -482,7 +686,8 @@ impl RoadNetwork {
         let radius_sq = radius * radius;
         let mut scratch: Vec<Point> = Vec::new();
 
-        for (_, seg) in self.segments() {
+        // Chantiers et voies rapides ne desservent pas les parcelles.
+        for (_, seg) in self.segments().filter(|(_, s)| s.is_open(now) && s.spec.class.serves_lots()) {
             seg.curve.sample_into(seg.curve.suggested_steps(), &mut scratch);
             let mut prev = scratch.first().map(|p| to_tile(*p, tile_size_m));
             for point in &scratch {
@@ -685,14 +890,14 @@ mod tests {
         let a = n.add_node(Point::new(Fixed::from_int(4), Fixed::from_int(4)));
         let b = n.add_node(Point::new(Fixed::from_int(76), Fixed::from_int(4)));
         n.connect(a, b, RoadSpec::TWO_WAY).unwrap();
-        let straight = n.rasterize_access(16, 16, 0, 8);
+        let straight = n.rasterize_access(16, 16, 0, 8, Tick::ZERO);
 
         // Poignées qui font bomber la route vers +y (nord).
         n.set_node_handle(a, Point::new(Fixed::from_int(20), Fixed::from_int(60)))
             .unwrap();
         n.set_node_handle(b, Point::new(Fixed::from_int(-20), Fixed::from_int(-60)))
             .unwrap();
-        let curved = n.rasterize_access(16, 16, 0, 8);
+        let curved = n.rasterize_access(16, 16, 0, 8, Tick::ZERO);
 
         let mid = n
             .curve_between(a, b)
@@ -735,7 +940,7 @@ mod tests {
         let a = n.add_node(Point::new(Fixed::from_int(0), Fixed::from_int(40)));
         let b = n.add_node(Point::new(Fixed::from_int(80), Fixed::from_int(40)));
         n.connect(a, b, RoadSpec::TWO_WAY).unwrap();
-        let access = n.rasterize_access(16, 16, 1, 8);
+        let access = n.rasterize_access(16, 16, 1, 8, Tick::ZERO);
         // Segment sur y=40m = tuile 5, de x=0..10.
         assert!(access[5 * 16 + 5]);
         assert!(access[6 * 16 + 5], "rayon 1 tuile vers le bas");

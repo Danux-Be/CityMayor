@@ -14,7 +14,7 @@ ASSETS = [
     "brick_wall_001", "painted_plaster_wall", "brown_planks_07", "plaster_grey_04",
     "rectangular_facade_tiles", "corrugated_iron_02", "clay_roof_tiles_02",
     "roof_slates_02", "box_profile_metal_sheet", "gravel_concrete", "asphalt_02",
-    "square_concrete_pavers", "concrete_wall_008", "leafy_grass",
+    "square_concrete_pavers", "concrete_wall_008", "leafy_grass", "gravel_road", "muddy_tracks", "asphalt_04",
 ]
 MAPS = {"Diffuse": "diff", "nor_gl": "nor"}
 

@@ -30,40 +30,30 @@ use sim_core::Terrain;
 pub const DEMO_MAP_TILES: u32 = 256;
 
 /// Construit un monde de démonstration sur un relief généré (collines,
-/// fleuve, lacs, montagnes à l'horizon) : des avenues tracées seulement sur la
-/// terre ferme, de part et d'autre du fleuve, un boulevard courbe et un
-/// zonage mixte. Vit ici (sans Bevy) pour être testé.
+/// fleuve, lacs, montagnes à l'horizon), avec tout le catalogue routier :
+/// rangées d'avenues, de rues, de boulevards et de sens uniques sur la terre
+/// ferme, une autoroute au nord reliée à la ville par un rond-point, un
+/// chemin vers la campagne et un boulevard courbe. Zonage mixte. Le réseau
+/// initial est livré ouvert ; [`demo_road_works`] ouvre ensuite un chantier.
+/// Vit ici (sans Bevy) pour être testé.
 #[must_use]
 pub fn demo_city() -> World {
     // Rayon d'accès de 3 tuiles : le premier rang de zonage est à deux tuiles
-    // de l'axe de l'avenue (14 m de chaussée + trottoirs), la tuile entre
-    // les deux sert d'accotement et de jardin de devant.
-    let config = SimConfig { road_access_radius_tiles: 3, ..SimConfig::default() };
-    let mut world = World::generated(
-        config,
-        0x0C17_CAFE,
-        WorldGenParams::default(),
-        DEMO_MAP_TILES,
-        DEMO_MAP_TILES,
-    );
+    // de l'axe de la route, la tuile entre les deux sert d'accotement et de
+    // jardin de devant.
+    let config = SimConfig { road_access_radius_tiles: 3, road_construction: false, ..SimConfig::default() };
+    let mut world = World::generated(config, 0x0C17_CAFE, WorldGenParams::default(), DEMO_MAP_TILES, DEMO_MAP_TILES);
     let max_slope = world.config().max_slope_cm;
     let dry = |world: &World, x: u32, y: u32| -> bool {
-        world
-            .zoning()
-            .grid()
-            .tile_at(x, y)
-            .is_some_and(|tile| world.terrain().is_buildable(tile, max_slope))
+        world.zoning().grid().tile_at(x, y).is_some_and(|tile| world.terrain().is_buildable(tile, max_slope))
     };
-
-    let mut west_ends = Vec::new();
-    for row in 0..21u32 {
-        let y = 24 + row * 10;
-        // Tronçons secs d'au moins 16 tuiles : le fleuve coupe une avenue en
-        // deux tronçons (pas encore de ponts).
+    // Tronçons secs d'au moins 16 tuiles sur une rangée : le fleuve coupe les
+    // routes est-ouest (pas encore de ponts).
+    let dry_runs = |world: &World, y: u32| -> Vec<(u32, u32)> {
         let mut runs = Vec::new();
         let mut start = None;
         for x in 6..DEMO_MAP_TILES - 6 {
-            match (dry(&world, x, y), start) {
+            match (dry(world, x, y), start) {
                 (true, None) => start = Some(x),
                 (false, Some(s)) => {
                     runs.push((s, x - 1));
@@ -75,31 +65,87 @@ pub fn demo_city() -> World {
         if let Some(s) = start {
             runs.push((s, DEMO_MAP_TILES - 7));
         }
-        for (x0, x1) in runs.into_iter().filter(|(a, b)| b - a >= 16) {
-            let (x0, x1) = (x0 + 1, x1 - 1);
-            world.queue(Command::BuildRoad {
-                from: Point::new(tile_center_m(x0 as i32), tile_center_m(y as i32)),
-                to: Point::new(tile_center_m(x1 as i32), tile_center_m(y as i32)),
-                spec: RoadSpec::AVENUE,
-            });
+        runs.into_iter().filter(|(a, b)| b - a >= 16).map(|(a, b)| (a + 1, b - 1)).collect()
+    };
+    let at = |x: u32, y: u32| Point::new(tile_center_m(x as i32), tile_center_m(y as i32));
+    let road = |world: &mut World, from: Point, to: Point, spec: RoadSpec| world.queue(Command::BuildRoad { from, to, spec });
+    let zone = |world: &mut World, x0: u32, x1: u32, y: u32| {
+        for (band, zone) in [
+            (y + 2, ZoneType::Residential),
+            (y + 3, ZoneType::Residential),
+            (y - 2, ZoneType::Commercial),
+            (y - 3, ZoneType::Industrial),
+        ] {
+            world.queue(Command::ZoneRect { rect: Rect::new(x0, band, x1, band), zone });
+        }
+    };
+
+    // --- rangées urbaines : le type de route varie d'une rangée à l'autre.
+    let row_spec = |row: u32| match row % 5 {
+        0 => RoadSpec::AVENUE,
+        1 | 4 => RoadSpec::TWO_WAY,
+        2 => RoadSpec::BOULEVARD,
+        _ => RoadSpec::ONE_WAY_SINGLE,
+    };
+    let mut west_ends = Vec::new();
+    let mut ring: Option<(u32, u32)> = None;
+    let mut last_east = None;
+    for row in 0..21u32 {
+        let y = 24 + row * 10;
+        let spec = row_spec(row);
+        for (x0, x1) in dry_runs(&world, y) {
+            // Sens uniques : un sens sur deux, d'est en ouest.
+            let (from, to) = if spec.is_one_way() && row % 2 == 1 { (at(x1, y), at(x0, y)) } else { (at(x0, y), at(x1, y)) };
+            if row == 0 && ring.is_none() && x1 - x0 > 60 {
+                // Premier tronçon de la première avenue : coupé par le rond-point.
+                let xr = x0 + 30;
+                ring = Some((xr, y));
+                let c = at(xr, y);
+                let r = Fixed::from_int(DEMO_ROUNDABOUT_RADIUS_M);
+                world.queue(Command::BuildRoundabout { center: c, radius_m: r, spec: RoadSpec::ONE_WAY });
+                road(&mut world, from, Point::new(c.x - r, c.y), spec);
+                road(&mut world, Point::new(c.x + r, c.y), to, spec);
+                zone(&mut world, x0, xr - 5, y);
+                zone(&mut world, xr + 5, x1, y);
+            } else {
+                road(&mut world, from, to, spec);
+                zone(&mut world, x0, x1, y);
+            }
             if x0 < 40 {
                 west_ends.push((x0, y));
             }
-            for (band, zone) in [
-                (y + 2, ZoneType::Residential),
-                (y + 3, ZoneType::Residential),
-                (y - 2, ZoneType::Commercial),
-                (y - 3, ZoneType::Industrial),
-            ] {
-                world.queue(Command::ZoneRect {
-                    rect: Rect::new(x0, band, x1, band),
-                    zone,
-                });
-            }
+            last_east = Some((x1, y));
         }
     }
 
-    // Boulevard courbe entre l'extrémité ouest de deux avenues. Ces nœuds
+    // --- autoroute au nord, reliée au rond-point par une rue. Le dernier
+    // tronçon à l'est est laissé au chantier (`demo_road_works`).
+    let hy = DEMO_HIGHWAY_ROW;
+    for (x0, x1) in dry_runs(&world, hy) {
+        let east = x1.saturating_sub(DEMO_HIGHWAY_WORKS_TILES).max(x0 + 8);
+        match ring {
+            Some((xr, _)) if xr > x0 && xr < east => {
+                road(&mut world, at(x0, hy), at(xr, hy), RoadSpec::HIGHWAY);
+                road(&mut world, at(xr, hy), at(east, hy), RoadSpec::HIGHWAY);
+            }
+            _ => road(&mut world, at(x0, hy), at(east, hy), RoadSpec::HIGHWAY),
+        }
+    }
+    if let Some((xr, yr)) = ring {
+        let c = at(xr, yr);
+        let r = Fixed::from_int(DEMO_ROUNDABOUT_RADIUS_M);
+        road(&mut world, at(xr, hy), Point::new(c.x, c.y - r), RoadSpec::TWO_WAY);
+    }
+
+    // --- chemin vers la campagne, au sud-est.
+    if let Some((x1, y)) = last_east {
+        let end_y = (y + 26).min(DEMO_MAP_TILES - 4);
+        if dry(&world, x1 - 12, end_y) {
+            road(&mut world, at(x1, y), at(x1 - 12, end_y), RoadSpec::GRAVEL);
+        }
+    }
+
+    // Boulevard courbe entre l'extrémité ouest de deux rangées. Ces nœuds
     // existent déjà (poignée nulle) et une poignée n'est appliquée qu'à un nœud
     // *créé* par la commande (invariant 11) : un seul segment serait une
     // droite. On passe par un nœud intermédiaire neuf, porteur de la tangente :
@@ -107,9 +153,9 @@ pub fn demo_city() -> World {
     if let (Some(&(ax, ay)), Some(&(bx, by))) = (west_ends.first(), west_ends.get(4)) {
         let (mx, my) = ((ax + bx) / 2 + 30, (ay + by) / 2);
         if dry(&world, mx, my) {
-            let middle = Point::new(tile_center_m(mx as i32), tile_center_m(my as i32));
+            let middle = at(mx, my);
             world.queue(Command::BuildCurve {
-                from: Point::new(tile_center_m(ax as i32), tile_center_m(ay as i32)),
+                from: at(ax, ay),
                 to: middle,
                 from_handle: Point::default(),
                 to_handle: Point::new(Fixed::ZERO, Fixed::from_int(110)),
@@ -117,7 +163,7 @@ pub fn demo_city() -> World {
             });
             world.queue(Command::BuildCurve {
                 from: middle,
-                to: Point::new(tile_center_m(bx as i32), tile_center_m(by as i32)),
+                to: at(bx, by),
                 from_handle: Point::default(),
                 to_handle: Point::default(),
                 spec: RoadSpec::TWO_WAY,
@@ -125,6 +171,65 @@ pub fn demo_city() -> World {
         }
     }
     world
+}
+
+/// Rangée (tuiles) de l'autoroute de la démo.
+pub const DEMO_HIGHWAY_ROW: u32 = 9;
+/// Rayon de l'anneau du rond-point de la démo (m).
+pub const DEMO_ROUNDABOUT_RADIUS_M: i32 = 20;
+/// Longueur (tuiles) du tronçon d'autoroute laissé au chantier.
+const DEMO_HIGHWAY_WORKS_TILES: u32 = 36;
+
+/// Ouvre le chantier de la démo : le dernier tronçon de l'autoroute, avec
+/// la durée de travaux normale (la route ouvrira en cours de partie).
+pub fn demo_road_works(world: &mut World) {
+    world.set_road_construction(true);
+    let hy = DEMO_HIGHWAY_ROW;
+    let at = |x: u32| Point::new(tile_center_m(x as i32), tile_center_m(hy as i32));
+    // Extrémité est actuelle de l'autoroute : le nœud le plus à l'est sur sa rangée.
+    let east = world
+        .roads()
+        .segments()
+        .filter(|(_, s)| s.spec == RoadSpec::HIGHWAY)
+        .flat_map(|(_, s)| [s.a, s.b])
+        .filter_map(|n| world.roads().node(n).map(|node| node.pos))
+        .max_by_key(|p| p.x);
+    if let Some(from) = east {
+        let x0 = (from.x.to_f32() / world.config().tile_size_m as f32) as u32;
+        let x1 = (x0 + DEMO_HIGHWAY_WORKS_TILES).min(DEMO_MAP_TILES - 7);
+        if x1 > x0 + 4 {
+            world.queue(Command::BuildRoad { from, to: at(x1), spec: RoadSpec::HIGHWAY });
+        }
+    }
+}
+
+/// Repères de la démo (pour le tour de captures) : nom et point visé (m).
+#[must_use]
+pub fn demo_landmarks(world: &World) -> Vec<(&'static str, [f32; 3])> {
+    let mut marks = Vec::new();
+    let mid = |s: &sim_core::RoadSegment| {
+        let p = s.curve.eval(Fixed::HALF);
+        let (x, z) = (p.x.to_f32(), p.y.to_f32());
+        [x, altitude_at(world, x, z), z]
+    };
+    if let Some(r) = world.roads().roundabouts().first() {
+        let (x, z) = (r.center.x.to_f32(), r.center.y.to_f32());
+        marks.push(("rond-point", [x, altitude_at(world, x, z), z]));
+    }
+    let now = world.current_tick();
+    if let Some((_, s)) = world.roads().segments().find(|(_, s)| !s.is_open(now)) {
+        marks.push(("chantier", mid(s)));
+    }
+    if let Some((_, s)) = world.roads().segments().find(|(_, s)| s.spec == RoadSpec::HIGHWAY && s.is_open(now)) {
+        marks.push(("autoroute", mid(s)));
+    }
+    if let Some((_, s)) = world.roads().segments().find(|(_, s)| s.spec == RoadSpec::BOULEVARD) {
+        marks.push(("boulevard", mid(s)));
+    }
+    if let Some((_, s)) = world.roads().segments().find(|(_, s)| s.spec == RoadSpec::ONE_WAY_SINGLE) {
+        marks.push(("sens-unique", mid(s)));
+    }
+    marks
 }
 
 /// Bloc de bâtiment prêt à être instancié (boîte alignée sur les axes).
@@ -151,11 +256,15 @@ impl BuildingBlock {
 pub struct RoadStrip {
     /// Points en mètres, Y = altitude du sol (+ surépaisseur anti z-fighting).
     pub points: Vec<[f32; 3]>,
+    /// Demi-largeur revêtue (`roads::Profile::half_width`).
     pub half_width_m: f32,
-    /// Nombre total de voies (choix du marquage).
-    pub lanes: u8,
+    pub spec: RoadSpec,
     /// Nœuds de départ et d'arrivée (indices) : carrefours et continuités.
     pub nodes: [u32; 2],
+    /// Avancement du chantier `[0, 1]` (1 = route ouverte).
+    pub progress: f32,
+    /// Centre du rond-point si ce segment appartient à un anneau.
+    pub ring_center: Option<[f32; 2]>,
 }
 
 /// Maillage de terrain prêt à téléverser.
@@ -229,7 +338,6 @@ pub fn roads(world: &World) -> Vec<RoadStrip> {
         else {
             continue;
         };
-        let lanes = segment.spec.total_lanes().max(1) as f32;
         let points = polyline
             .iter()
             .map(|p| {
@@ -238,11 +346,19 @@ pub fn roads(world: &World) -> Vec<RoadStrip> {
                 [x, altitude_at(world, x, z) + ROAD_LIFT_M, z]
             })
             .collect();
+        let ring_center = world
+            .roads()
+            .roundabouts()
+            .iter()
+            .find(|r| r.nodes.contains(&segment.a) && r.nodes.contains(&segment.b))
+            .map(|r| [r.center.x.to_f32(), r.center.y.to_f32()]);
         strips.push(RoadStrip {
             points,
-            half_width_m: lanes * 3.5 * 0.5,
-            lanes: segment.spec.total_lanes(),
+            half_width_m: crate::roads::Profile::of(segment.spec).half_width(),
+            spec: segment.spec,
             nodes: [segment.a.raw(), segment.b.raw()],
+            progress: segment.construction_progress(world.current_tick()).to_f32(),
+            ring_center,
         });
     }
     strips
@@ -351,8 +467,13 @@ mod tests {
         world.tick();
         let roads = world.roads();
         assert!(roads.live_segments() >= 20, "{} segments", roads.live_segments());
-        let curved = roads.segments().filter(|(_, seg)| !seg.curve.is_straight()).count();
+        let curved = roads.segments().filter(|(_, seg)| !seg.curve.is_straight() && !seg.fixed_curve).count();
         assert_eq!(curved, 2, "le boulevard doit être courbe");
+        // Tout le catalogue de la démo est présent.
+        for spec in [RoadSpec::AVENUE, RoadSpec::TWO_WAY, RoadSpec::BOULEVARD, RoadSpec::ONE_WAY_SINGLE, RoadSpec::HIGHWAY, RoadSpec::GRAVEL] {
+            assert!(roads.segments().any(|(_, s)| s.spec == spec), "{spec:?} absent de la démo");
+        }
+        assert_eq!(roads.roundabouts().len(), 1);
         // Aucune route ne part d'une tuile noyée.
         let tile = world.config().tile_size_m as f32;
         for (_, node) in roads.nodes() {
@@ -363,7 +484,8 @@ mod tests {
     }
 
     fn demo() -> World {
-        let mut world = World::new(SimConfig::default(), 21, Terrain::flat(32, 32));
+        let config = SimConfig { road_construction: false, ..SimConfig::default() };
+        let mut world = World::new(config, 21, Terrain::flat(32, 32));
         world.queue(Command::BuildRoad {
             from: Point::new(tile_center_m(2), tile_center_m(8)),
             to: Point::new(tile_center_m(28), tile_center_m(8)),

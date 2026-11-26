@@ -46,7 +46,7 @@ use sim_core::{FixedStepClock, World, ZoneType};
 
 use std::collections::HashMap;
 
-use crate::{nature, scene, urban};
+use crate::{nature, roads, scene, urban};
 
 /// Ticks simulés avant d'ouvrir la fenêtre : la ville est déjà peuplée.
 const PRESIMULATION_TICKS: u32 = 2_400;
@@ -106,10 +106,14 @@ impl MaterialExtension for UrbanExtension {
 /// Lancée par le binaire `city-viewer`.
 pub fn run() {
     let mut world = scene::demo_city();
-    for _ in 0..PRESIMULATION_TICKS {
+    for tick in 0..PRESIMULATION_TICKS {
+        // À mi-parcours : un chantier d'autoroute, encore en cours à l'ouverture.
+        if tick == PRESIMULATION_TICKS / 2 {
+            scene::demo_road_works(&mut world);
+        }
         world.tick();
     }
-    let tour = std::env::var_os("CITYMAYOR_TOUR").is_some();
+    let tour = Tour::new(std::env::var_os("CITYMAYOR_TOUR").is_some(), &world);
 
     // Langue de l'interface : anglais pour l'instant (fichiers `locales/`).
     let texts = city_i18n::Localizer::english();
@@ -135,7 +139,7 @@ pub fn run() {
     .insert_resource(Texts(texts))
     .insert_resource(Handles::default())
     .insert_resource(City::default())
-    .insert_resource(Tour::new(tour))
+    .insert_resource(tour)
     // `ScreenshotPlugin` est déjà fourni par `DefaultPlugins` en Bevy 0.20.
     .add_systems(Startup, setup)
     .add_systems(
@@ -220,7 +224,8 @@ const CITY_CHUNK_TILES: u32 = 16;
 #[derive(Resource, Default)]
 struct City {
     roads: urban::RoadIndex,
-    road_segments: u32,
+    /// Empreinte du réseau : segments et avancement des chantiers.
+    road_signature: (u32, u32),
     chunks: HashMap<(u32, u32), CityChunk>,
 }
 
@@ -240,16 +245,25 @@ impl City {
     ) -> Vec<[f32; 4]> {
         let mut changed = Vec::new();
         let size = world.config().tile_size_m as f32;
-        let segments = world.roads().live_segments();
-        let roads_changed = segments != self.road_segments || self.chunks.is_empty();
-        if roads_changed {
+        // Chantiers : l'avancement (par pas de 5 %) fait partie de l'empreinte.
+        let now = world.current_tick();
+        let works: u32 = world
+            .roads()
+            .segments()
+            .filter(|(_, s)| !s.is_open(now))
+            .map(|(_, s)| (s.construction_progress(now).to_f32() * 20.0) as u32 + 1)
+            .sum();
+        let signature = (world.roads().live_segments(), works);
+        let network_changed = signature.0 != self.road_signature.0 || self.chunks.is_empty();
+        if signature != self.road_signature || self.chunks.is_empty() {
             let strips = scene::roads(world);
             self.roads = urban::RoadIndex::new(&strips);
-            self.road_segments = segments;
+            self.road_signature = signature;
             if let Some(mut mesh) = meshes.get_mut(&handles.roads) {
-                *mesh = urban_mesh(urban::road_mesh(world, &strips), RenderAssetUsages::default());
+                *mesh = urban_mesh(roads::road_mesh(world, &strips), RenderAssetUsages::default());
             }
         }
+        let roads_changed = network_changed;
         let grid = world.zoning().grid();
         let (w, h) = (grid.width(), grid.height());
         for cy in (0..h).step_by(CITY_CHUNK_TILES as usize) {
@@ -420,8 +434,8 @@ fn urban_layers() -> Image {
         "00_brique_fenetres", "01_brique", "02_enduit_fenetres", "03_enduit",
         "04_bardage_fenetres", "05_bardage", "06_immeuble", "07_vitrine", "08_bureaux",
         "09_industrie", "10_tuiles", "11_ardoises", "12_toit_tole", "13_toit_plat",
-        "14_route_2_voies", "15_route_4_voies", "16_trottoir", "17_beton", "18_pelouse",
-        "19_porte",
+        "14_asphalte", "15_marquage", "16_trottoir", "17_beton", "18_pelouse",
+        "19_porte", "20_chemin", "21_chantier", "22_fleche", "23_glissiere", "24_balise",
     );
     texture_array("urban_layers", &SOURCES, &urban::LAYER_NAMES)
 }
@@ -911,11 +925,12 @@ fn refresh_city(
     mut since_last: Local<f32>,
 ) {
     *since_last += time.delta_secs();
-    let signature = sim.current_signature();
-    if *built_signature == Some(signature) || (built_signature.is_some() && *since_last < 0.5) {
+    // `City::refresh` compare lui-même les empreintes (bâtiments par morceau,
+    // réseau, avancement des chantiers) : on ne fait que limiter la cadence.
+    if built_signature.is_some() && *since_last < 0.5 {
         return;
     }
-    *built_signature = Some(signature);
+    *built_signature = Some(sim.current_signature());
     *since_last = 0.0;
     let world = &sim.world;
     let changed = city.refresh(world, &mut commands, &mut meshes, &handles);
@@ -1043,18 +1058,36 @@ struct Tour {
     /// Images rendues et temps cumulé, pour la mesure de performance.
     frames: u32,
     frame_time: f32,
+    /// Vues : nom, point visé (m), lacet, inclinaison, distance.
+    views: Vec<(String, Vec3, f32, f32, f32)>,
 }
 
+/// Vues rapprochées des repères de la démo (`scene::demo_landmarks`) :
+/// (nom, lacet, inclinaison, distance).
+const LANDMARK_VIEWS: [(&str, f32, f32, f32); 5] = [
+    ("rond-point", 0.7, 0.75, 110.0),
+    ("chantier", 2.2, 0.35, 120.0),
+    ("autoroute", 1.2, 0.62, 110.0),
+    ("boulevard", 1.1, 0.3, 70.0),
+    ("sens-unique", 0.2, 0.75, 80.0),
+];
+
 impl Tour {
-    fn new(active: bool) -> Self {
-        Self {
-            active,
-            step: 0,
-            elapsed: 0.0,
-            shot_taken: false,
-            frames: 0,
-            frame_time: 0.0,
+    fn new(active: bool, world: &World) -> Self {
+        let (w, h) = nature::play_size_m(world);
+        let mut views: Vec<_> = TOUR_VIEWS
+            .iter()
+            .map(|(name, fx, fz, yaw, pitch, distance)| {
+                ((*name).to_owned(), Vec3::new(w * (0.5 + fx), 0.0, h * (0.5 + fz)), *yaw, *pitch, *distance)
+            })
+            .collect();
+        let marks = scene::demo_landmarks(world);
+        for (name, yaw, pitch, distance) in LANDMARK_VIEWS {
+            if let Some((_, p)) = marks.iter().find(|(n, _)| *n == name) {
+                views.push((name.to_owned(), Vec3::from(*p), yaw, pitch, distance));
+            }
         }
+        Self { active, step: 0, elapsed: 0.0, shot_taken: false, frames: 0, frame_time: 0.0, views }
     }
 }
 
@@ -1075,7 +1108,6 @@ const TOUR_VIEWS: [(&str, f32, f32, f32, f32, f32); 10] = [
 fn tour_step(
     mut commands: Commands,
     time: Res<Time>,
-    sim: Res<Sim>,
     mut tour: ResMut<Tour>,
     mut cameras: Query<&mut OrbitCamera>,
     mut exit: MessageWriter<AppExit>,
@@ -1083,7 +1115,7 @@ fn tour_step(
     if !tour.active {
         return;
     }
-    let Some(&(name, fx, fz, yaw, pitch, distance)) = TOUR_VIEWS.get(tour.step) else {
+    let Some((name, focus, yaw, pitch, distance)) = tour.views.get(tour.step).cloned() else {
         if tour.frames > 0 {
             let average = tour.frame_time / tour.frames as f32;
             println!(
@@ -1103,9 +1135,8 @@ fn tour_step(
         tour.frame_time += time.delta_secs();
     }
     if tour.elapsed < 0.1 {
-        let (w, h) = nature::play_size_m(&sim.world);
         for mut camera in &mut cameras {
-            camera.target_focus = Vec3::new(w * (0.5 + fx), 0.0, h * (0.5 + fz));
+            camera.target_focus = focus;
             camera.target_yaw = yaw;
             camera.target_pitch = pitch;
             camera.target_distance = distance;

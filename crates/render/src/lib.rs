@@ -29,6 +29,7 @@
 //!   (`World::overlay_cell`), donc zéro duplication de géométrie.
 
 pub mod nature;
+pub mod roads;
 pub mod scene;
 pub mod urban;
 

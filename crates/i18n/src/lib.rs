@@ -33,11 +33,12 @@ use unic_langid::LanguageIdentifier;
 pub const REFERENCE_LANGUAGE: &str = "en";
 
 /// Fichiers anglais embarqués (nom, contenu).
-pub const ENGLISH_FILES: [(&str, &str); 4] = [
+pub const ENGLISH_FILES: [(&str, &str); 5] = [
     ("common.ftl", include_str!("../../../locales/en/common.ftl")),
     ("simulation.ftl", include_str!("../../../locales/en/simulation.ftl")),
     ("errors.ftl", include_str!("../../../locales/en/errors.ftl")),
     ("interface.ftl", include_str!("../../../locales/en/interface.ftl")),
+    ("roads.ftl", include_str!("../../../locales/en/roads.ftl")),
 ];
 
 /// Argument d'un message (`{ $name }` dans le fichier Fluent).

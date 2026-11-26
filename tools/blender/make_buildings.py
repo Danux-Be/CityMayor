@@ -53,12 +53,17 @@ LAYERS = [
     ("11_ardoises", 4.0, 4.0),
     ("12_toit_tole", 4.0, 4.0),
     ("13_toit_plat", 8.0, 8.0),
-    ("14_route_2_voies", 7.0, 8.0),
-    ("15_route_4_voies", 14.0, 8.0),
+    ("14_asphalte", 8.0, 8.0),
+    ("15_marquage", 2.0, 2.0),
     ("16_trottoir", 4.0, 4.0),
     ("17_beton", 4.0, 4.0),
     ("18_pelouse", 6.0, 6.0),
     ("19_porte", 1.6, 2.8),
+    ("20_chemin", 6.0, 6.0),
+    ("21_chantier", 6.0, 6.0),
+    ("22_fleche", 3.5, 7.0),
+    ("23_glissiere", 4.0, 0.32),
+    ("24_balise", 2.0, 1.0),
 ]
 
 # Taille réelle (m) des photos Poly Haven : on les répète un nombre entier de
@@ -68,7 +73,7 @@ SOURCE_SIZE = {
     "plaster_grey_04": 1.5, "rectangular_facade_tiles": 2.0, "corrugated_iron_02": 2.7,
     "clay_roof_tiles_02": 2.5, "roof_slates_02": 3.0, "box_profile_metal_sheet": 2.0,
     "gravel_concrete": 2.12, "asphalt_02": 3.0, "square_concrete_pavers": 1.8,
-    "concrete_wall_008": 2.71, "leafy_grass": 2.0,
+    "concrete_wall_008": 2.71, "leafy_grass": 2.0, "gravel_road": 2.0, "muddy_tracks": 2.25, "asphalt_04": 4.0,
 }
 
 
@@ -463,6 +468,76 @@ def layer_road(scene, lanes):
             box("voie", x - 0.07, 1.0, 0, x + 0.07, 4.0, 0.005, paint)
 
 
+def road_paint():
+    """Peinture routière : blanc légèrement usé (bruit), mate."""
+    mat = bpy.data.materials.new("peinture")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    bsdf = next(n for n in nt.nodes if n.type == "BSDF_PRINCIPLED")
+    bsdf.inputs["Roughness"].default_value = 0.55
+    noise = nt.nodes.new("ShaderNodeTexNoise")
+    noise.inputs["Scale"].default_value = 18.0
+    noise.inputs["Detail"].default_value = 8.0
+    ramp = nt.nodes.new("ShaderNodeValToRGB")
+    ramp.color_ramp.elements[0].position = 0.35
+    ramp.color_ramp.elements[0].color = (0.78, 0.78, 0.76, 1)
+    ramp.color_ramp.elements[1].position = 0.6
+    ramp.color_ramp.elements[1].color = (0.9, 0.9, 0.87, 1)
+    nt.links.new(noise.outputs["Fac"], ramp.inputs["Fac"])
+    nt.links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
+    return mat
+
+
+def layer_asphalt(scene):
+    layer_roof(scene, "asphalt_04", 8, 8, saturation=0.2, value=0.42)
+
+
+def layer_marking(scene):
+    quad("peinture", [(-M, -M, 0), (2 + M, -M, 0), (2 + M, 2 + M, 0), (-M, 2 + M, 0)], road_paint())
+
+
+def layer_arrow(scene):
+    """Flèche directionnelle au sol (sens de circulation vers le haut de l'image)."""
+    w, h = 3.5, 7.0
+    asphalt = photo("asphalt_04", 8, 8, saturation=0.2, value=0.42)
+    quad("chaussee", [(-M, -M, 0), (w + M, -M, 0), (w + M, h + M, 0), (-M, h + M, 0)], asphalt)
+    paint = road_paint()
+    mid = w / 2
+    box("hampe", mid - 0.15, 1.2, 0, mid + 0.15, 4.6, 0.005, paint)
+    mesh = bpy.data.meshes.new("pointe")
+    mesh.from_pydata([(mid - 0.6, 4.6, 0.005), (mid + 0.6, 4.6, 0.005), (mid, 5.9, 0.005)], [], [(0, 1, 2)])
+    obj = bpy.data.objects.new("pointe", mesh)
+    obj.data.materials.append(paint)
+    bpy.context.scene.collection.objects.link(obj)
+
+
+def layer_guardrail(scene):
+    """Glissière métallique vue de face : lisse en W galvanisée (32 cm)."""
+    w, h = 4.0, 0.32
+    steel = flat("acier_galva", (0.5, 0.52, 0.54), 0.45, 0.6)
+    dark = flat("poteau", (0.32, 0.33, 0.35), 0.5, 0.8)
+    back = flat("fond", (0.05, 0.05, 0.05), 1.0)
+    # La couche entière est la lisse en W (le jeu pose les poteaux à part) :
+    # trois bandes inclinées alternées sur toute la hauteur de la cellule.
+    del back, dark
+    bands = [(-M, 0.11, 0.0, 0.03), (0.11, 0.21, 0.03, 0.0), (0.21, h + M, 0.0, 0.03)]
+    for k, (y0, y1, z0, z1) in enumerate(bands):
+        quad(f"lisse{k}", [(-M, y0, z0), (w + M, y0, z0), (w + M, y1, z1), (-M, y1, z1)], steel)
+    for x in (0.0, 4.0):  # boulons de jonction (raccord des deux bords)
+        box("boulon", x - 0.05, 0.12, 0.03, x + 0.05, 0.2, 0.05, steel)
+
+
+def layer_beacon(scene):
+    """Balise de chantier rayée rouge et blanc (vue de face)."""
+    w, h = 2.0, 1.0
+    red = flat("rouge", (0.72, 0.06, 0.04), 0.5)
+    white = flat("blanc", (0.92, 0.92, 0.9), 0.5)
+    for k in range(-1, 9):
+        x0 = k * 0.25
+        mat = red if k % 2 == 0 else white
+        quad("bande", [(x0, -M, 0), (x0 + 0.25, -M, 0), (x0 + 0.25 + 0.4, h + M, 0), (x0 + 0.4, h + M, 0)], mat)
+
+
 def layer_door(scene):
     w, h = 1.6, 2.8
     surround = flat("encadrement", (0.78, 0.76, 0.72), 0.8)
@@ -505,14 +580,19 @@ def main():
         "12_toit_tole": lambda s: layer_roof(s, "box_profile_metal_sheet", 4, 4, saturation=0.15,
                                             value=1.6),
         "13_toit_plat": lambda s: layer_roof(s, "gravel_concrete", 8, 8, saturation=0.3),
-        "14_route_2_voies": lambda s: layer_road(s, 2),
-        "15_route_4_voies": lambda s: layer_road(s, 4),
+        "14_asphalte": layer_asphalt,
+        "15_marquage": layer_marking,
         "16_trottoir": lambda s: layer_roof(s, "square_concrete_pavers", 4, 4, saturation=0.12,
                                            value=1.25),
         "17_beton": lambda s: layer_roof(s, "concrete_wall_008", 4, 4, saturation=0.3),
         "18_pelouse": lambda s: layer_roof(s, "leafy_grass", 6, 6, tint=(0.8, 1.0, 0.7),
                                           saturation=1.2),
         "19_porte": layer_door,
+        "20_chemin": lambda s: layer_roof(s, "gravel_road", 6, 6, saturation=0.8),
+        "21_chantier": lambda s: layer_roof(s, "muddy_tracks", 6, 6, saturation=0.9),
+        "22_fleche": layer_arrow,
+        "23_glissiere": layer_guardrail,
+        "24_balise": layer_beacon,
     }
     only = set(ARGS[1:])
     for name, w, h in LAYERS:

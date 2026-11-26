@@ -15,7 +15,7 @@ fn p(tx: i32, ty: i32) -> Point {
 /// Ville de référence : un croisement, du résidentiel orienté sud, du
 /// commercial au nord, de l'industrie le long de la rue verticale.
 fn demo_world() -> World {
-    let mut world = World::new(SimConfig::default(), 0xDEAD_BEEF, Terrain::flat(32, 32));
+    let mut world = World::new(instant_roads(), 0xDEAD_BEEF, Terrain::flat(32, 32));
     world.queue(Command::BuildRoad {
         from: p(2, 8),
         to: p(28, 8),
@@ -45,6 +45,13 @@ fn run(world: &mut World, ticks: u32) {
     for _ in 0..ticks {
         world.tick();
     }
+}
+
+
+/// Configuration des scénarios : routes ouvertes dès leur tracé. Le chantier
+/// routier a ses propres tests (`road_works_*`).
+fn instant_roads() -> SimConfig {
+    SimConfig { road_construction: false, ..SimConfig::default() }
 }
 
 #[test]
@@ -78,7 +85,7 @@ fn commands_are_applied_at_the_tick_boundary() {
 
 #[test]
 fn zoning_without_road_access_builds_nothing() {
-    let mut world = World::new(SimConfig::default(), 1, Terrain::flat(24, 24));
+    let mut world = World::new(instant_roads(), 1, Terrain::flat(24, 24));
     world.queue(Command::ZoneRect {
         rect: Rect::new(2, 2, 16, 16),
         zone: ZoneType::Residential,
@@ -92,7 +99,7 @@ fn zoning_without_road_access_builds_nothing() {
 
 #[test]
 fn out_of_bounds_road_is_rejected_without_side_effects() {
-    let mut world = World::new(SimConfig::default(), 2, Terrain::flat(16, 16));
+    let mut world = World::new(instant_roads(), 2, Terrain::flat(16, 16));
     world.queue(Command::BuildRoad {
         from: Point::new(Fixed::from_int(-50), Fixed::from_int(10)),
         to: Point::new(Fixed::from_int(10), Fixed::from_int(10)),
@@ -109,7 +116,7 @@ fn out_of_bounds_road_is_rejected_without_side_effects() {
 
 #[test]
 fn duplicate_road_is_rejected() {
-    let mut world = World::new(SimConfig::default(), 3, Terrain::flat(16, 16));
+    let mut world = World::new(instant_roads(), 3, Terrain::flat(16, 16));
     for _ in 0..2 {
         world.queue(Command::BuildRoad {
             from: p(1, 1),
@@ -129,7 +136,7 @@ fn duplicate_road_is_rejected() {
 
 #[test]
 fn roads_snap_onto_existing_nodes() {
-    let mut world = World::new(SimConfig::default(), 4, Terrain::flat(16, 16));
+    let mut world = World::new(instant_roads(), 4, Terrain::flat(16, 16));
     world.queue(Command::BuildRoad {
         from: p(2, 2),
         to: p(12, 2),
@@ -178,7 +185,7 @@ fn city_grows_fills_homes_and_creates_jobs() {
 
 #[test]
 fn industrial_and_commercial_wait_for_residents() {
-    let mut world = World::new(SimConfig::default(), 5, Terrain::flat(24, 24));
+    let mut world = World::new(instant_roads(), 5, Terrain::flat(24, 24));
     world.queue(Command::BuildRoad {
         from: p(2, 6),
         to: p(20, 6),
@@ -224,8 +231,8 @@ fn simulation_is_deterministic_across_runs() {
 fn different_seeds_do_not_change_a_deterministic_pipeline() {
     // Tant qu'aucun système ne consomme le RNG, la ville doit être identique :
     // c'est le test qui échouera le jour où on ajoutera du bruit non documenté.
-    let mut a = World::new(SimConfig::default(), 111, Terrain::flat(24, 24));
-    let mut b = World::new(SimConfig::default(), 222, Terrain::flat(24, 24));
+    let mut a = World::new(instant_roads(), 111, Terrain::flat(24, 24));
+    let mut b = World::new(instant_roads(), 222, Terrain::flat(24, 24));
     for world in [&mut a, &mut b] {
         world.queue(Command::BuildRoad {
             from: p(2, 6),
@@ -263,7 +270,7 @@ fn bulldoze_removes_buildings_and_dezones() {
 
 #[test]
 fn zoning_never_overwrites_a_built_tile() {
-    let mut world = World::new(SimConfig::default(), 6, Terrain::flat(16, 16));
+    let mut world = World::new(instant_roads(), 6, Terrain::flat(16, 16));
     world.queue(Command::BuildRoad {
         from: p(1, 4),
         to: p(14, 4),
@@ -305,7 +312,7 @@ fn budget_settles_at_month_boundaries() {
     let config = SimConfig {
         ticks_per_day: 10,
         days_per_month: 1,
-        ..SimConfig::default()
+        ..instant_roads()
     };
     let mut world = World::new(config, 8, Terrain::flat(16, 16));
 
@@ -358,7 +365,7 @@ fn unhoused_city_keeps_zero_population() {
 fn scale_smoke_test_a_bigger_map_stays_consistent() {
     // Pas d'assertion de temps (machine-dépendante) : on vérifie seulement que
     // les budgets par tick tiennent et que l'état reste cohérent à l'échelle.
-    let mut world = World::new(SimConfig::default(), 9, Terrain::flat(128, 128));
+    let mut world = World::new(instant_roads(), 9, Terrain::flat(128, 128));
     for row in 0..6 {
         let y = 8 + row * 12;
         world.queue(Command::BuildRoad {
@@ -388,7 +395,7 @@ fn scale_smoke_test_a_bigger_map_stays_consistent() {
 fn jobless_city_does_not_collapse() {
     // Anti "death wave" : une ville résidentielle sans un seul emploi doit se
     // stabiliser avec un bonheur bas mais non nul, pas se vider.
-    let mut world = World::new(SimConfig::default(), 10, Terrain::flat(24, 24));
+    let mut world = World::new(instant_roads(), 10, Terrain::flat(24, 24));
     world.queue(Command::BuildRoad {
         from: p(2, 6),
         to: p(20, 6),
@@ -456,7 +463,7 @@ fn growth_scales_to_a_million_inhabitant_map() {
     // rangs zonés de chaque côté. On vérifie que la loi de croissance composée
     // peuple réellement une carte de cette taille, et que les budgets de tick
     // tiennent (aucune assertion de temps : le CI n'est pas une machine de jeu).
-    let mut world = World::new(SimConfig::default(), 11, Terrain::flat(256, 256));
+    let mut world = World::new(instant_roads(), 11, Terrain::flat(256, 256));
     for row in 0..42u32 {
         let y = 6 + row * 6;
         world.queue(Command::BuildRoad {
@@ -505,7 +512,7 @@ fn growth_scales_to_a_million_inhabitant_map() {
 
 #[test]
 fn curved_road_command_serves_the_bulge() {
-    let mut world = World::new(SimConfig::default(), 12, Terrain::flat(32, 32));
+    let mut world = World::new(instant_roads(), 12, Terrain::flat(32, 32));
     world.queue(Command::BuildCurve {
         from: p(2, 10),
         to: p(30, 10),
@@ -578,7 +585,7 @@ fn saturated_city_keeps_aggregates_consistent() {
 #[test]
 fn generated_world_grows_on_dry_land_only() {
     use sim_core::WorldGenParams;
-    let mut world = World::generated(SimConfig::default(), 3, WorldGenParams::default(), 96, 96);
+    let mut world = World::generated(instant_roads(), 3, WorldGenParams::default(), 96, 96);
     assert!(world.worldgen().is_some());
     // Une avenue en travers de la carte, zonage résidentiel/commercial/industriel.
     world.queue(Command::BuildRoad {
@@ -598,4 +605,89 @@ fn generated_world_grows_on_dry_land_only() {
         let altitude = world.terrain().altitude_cm(building.tile).unwrap();
         assert!(altitude > sim_core::terrain::WATER_LEVEL_CM, "bâtiment dans l'eau");
     }
+}
+
+#[test]
+fn road_works_delay_access_until_the_road_opens() {
+    let mut world = World::new(SimConfig::default(), 21, Terrain::flat(32, 32));
+    world.queue(Command::BuildRoad {
+        from: Point::new(tile_center_m(2), tile_center_m(10)),
+        to: Point::new(tile_center_m(28), tile_center_m(10)),
+        spec: RoadSpec::TWO_WAY,
+    });
+    world.queue(Command::ZoneRect { rect: Rect::new(3, 11, 26, 12), zone: ZoneType::Residential });
+    world.tick();
+    let (id, segment) = world.roads().segments().next().unwrap();
+    let opens = segment.opens_at.raw();
+    let expected = RoadSpec::TWO_WAY.construction_ticks(segment.length_m);
+    assert_eq!(opens, expected, "chantier de {expected} ticks");
+    assert!(world.road_access_view().iter().all(|a| !a), "un chantier ne dessert rien");
+    let mut opened = 0;
+    while world.current_tick().raw() <= opens {
+        let report = world.tick();
+        for event in &report.events {
+            if let sim_core::SimEvent::RoadsOpened { count } = event {
+                opened += count;
+            }
+        }
+        // Pendant le chantier : avancement croissant, rien ne pousse.
+        if world.current_tick().raw() < opens {
+            assert_eq!(world.buildings().live_count(), 0);
+        }
+    }
+    assert_eq!(opened, 1);
+    assert!(world.roads().segment(id).unwrap().is_open(world.current_tick()));
+    assert!(world.road_access_view().iter().any(|a| *a), "route ouverte : desserte");
+    for _ in 0..400 {
+        world.tick();
+    }
+    assert!(world.buildings().live_count() > 0, "la ville pousse après l'ouverture");
+}
+
+#[test]
+fn highways_do_not_serve_lots() {
+    let mut world = World::new(instant_roads(), 22, Terrain::flat(32, 32));
+    world.queue(Command::BuildRoad {
+        from: Point::new(tile_center_m(2), tile_center_m(10)),
+        to: Point::new(tile_center_m(28), tile_center_m(10)),
+        spec: RoadSpec::HIGHWAY,
+    });
+    world.tick();
+    assert_eq!(world.roads().live_segments(), 1);
+    assert!(world.road_access_view().iter().all(|a| !a));
+}
+
+#[test]
+fn roundabouts_are_closed_one_way_rings_that_streets_can_join() {
+    let mut world = World::new(instant_roads(), 23, Terrain::flat(32, 32));
+    let center = Point::new(tile_center_m(16), tile_center_m(16));
+    world.queue(Command::BuildRoundabout { center, radius_m: Fixed::from_int(18), spec: RoadSpec::ONE_WAY });
+    // Une rue qui arrive au nœud est de l'anneau (18 m à l'est du centre).
+    world.queue(Command::BuildRoad {
+        from: Point::new(center.x + Fixed::from_int(18), center.y),
+        to: Point::new(tile_center_m(30), tile_center_m(16)),
+        spec: RoadSpec::TWO_WAY,
+    });
+    world.tick();
+    let roads = world.roads();
+    assert_eq!(roads.roundabouts().len(), 1);
+    assert_eq!(roads.live_segments(), 9, "8 arcs + la rue raccordée");
+    let ring = &roads.roundabouts()[0];
+    // Anneau fermé, à sens unique, chaque arc sur le cercle (± 5 cm).
+    for (i, node) in ring.nodes.iter().enumerate() {
+        let next = ring.nodes[(i + 1) % 8];
+        let seg = roads.segment(roads.find_segment(*node, next).unwrap()).unwrap();
+        assert_eq!((seg.a, seg.b), (*node, next), "sens de circulation");
+        assert!(seg.spec.is_one_way());
+        for k in 0..=8 {
+            let p = seg.curve.eval(Fixed::from_ratio(k, 8));
+            let d = p.distance(center).to_f32();
+            assert!((d - 18.0).abs() < 0.05, "arc hors du cercle : {d}");
+        }
+    }
+    // La rue s'est accrochée au nœud est et y arrive droite.
+    let east = ring.nodes[0];
+    let street = roads.segments().find(|(_, s)| !s.spec.is_one_way()).unwrap().1;
+    assert!(street.a == east || street.b == east);
+    assert!(street.curve.is_straight());
 }

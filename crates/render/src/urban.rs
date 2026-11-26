@@ -34,7 +34,7 @@ use crate::nature::{ground_altitude_m, Species, TreeSpot};
 use crate::scene::RoadStrip;
 
 /// Nombre de couches du tableau de textures urbaines.
-pub const LAYER_COUNT: usize = 20;
+pub const LAYER_COUNT: usize = 25;
 
 /// Fichiers des couches (`assets/urban/<nom>.jpg`), dans l'ordre du tableau.
 pub const LAYER_NAMES: [&str; LAYER_COUNT] = [
@@ -52,12 +52,17 @@ pub const LAYER_NAMES: [&str; LAYER_COUNT] = [
     "11_ardoises",
     "12_toit_tole",
     "13_toit_plat",
-    "14_route_2_voies",
-    "15_route_4_voies",
+    "14_asphalte",
+    "15_marquage",
     "16_trottoir",
     "17_beton",
     "18_pelouse",
     "19_porte",
+    "20_chemin",
+    "21_chantier",
+    "22_fleche",
+    "23_glissiere",
+    "24_balise",
 ];
 
 /// Taille d'une répétition de chaque couche (largeur, hauteur) en mètres :
@@ -77,12 +82,17 @@ pub const LAYER_SIZE_M: [[f32; 2]; LAYER_COUNT] = [
     [4.0, 4.0],
     [4.0, 4.0],
     [8.0, 8.0],
-    [7.0, 8.0],
-    [14.0, 8.0],
+    [8.0, 8.0],
+    [2.0, 2.0],
     [4.0, 4.0],
     [4.0, 4.0],
     [6.0, 6.0],
     [1.6, 2.8],
+    [6.0, 6.0],
+    [6.0, 6.0],
+    [3.5, 7.0],
+    [4.0, 0.32],
+    [2.0, 1.0],
 ];
 
 /// L'indice de couche est codé dans l'alpha de la couleur : `a = couche / 32`.
@@ -105,12 +115,17 @@ pub enum Layer {
     Slate,
     MetalRoof,
     FlatRoof,
-    Road2,
-    Road4,
+    Asphalt,
+    Marking,
     Sidewalk,
     Concrete,
     Lawn,
     Door,
+    Gravel,
+    Works,
+    Arrow,
+    Guardrail,
+    Beacon,
 }
 
 impl Layer {
@@ -124,7 +139,7 @@ impl Layer {
         LAYER_SIZE_M[self as usize]
     }
 
-    fn alpha(self) -> f32 {
+    pub(crate) fn alpha(self) -> f32 {
         self as usize as f32 / LAYER_ENCODING
     }
 }
@@ -136,11 +151,6 @@ pub const SHOP_FLOOR_M: f32 = 4.5;
 /// Trottoir : surélévation au-dessus de la chaussée.
 pub const CURB_M: f32 = 0.15;
 
-/// Largeur de trottoir selon la demi-largeur de chaussée.
-#[must_use]
-pub fn sidewalk_width(half_width_m: f32) -> f32 {
-    if half_width_m >= 6.0 { 2.5 } else { 2.0 }
-}
 
 /// Géométrie urbaine prête à téléverser.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -193,7 +203,7 @@ impl UrbanMesh {
     /// Polygone convexe plan (éventail). La face regarde du côté de `facing`
     /// (l'ordre des sommets est inversé si besoin) : le culling et l'éclairage
     /// voient toujours l'extérieur.
-    fn polygon(&mut self, points: &[[f32; 3]], uvs: &[[f32; 2]], layer: Layer, tint: [f32; 3], facing: [f32; 3]) {
+    pub(crate) fn polygon(&mut self, points: &[[f32; 3]], uvs: &[[f32; 2]], layer: Layer, tint: [f32; 3], facing: [f32; 3]) {
         debug_assert_eq!(points.len(), uvs.len());
         if points.len() < 3 {
             return;
@@ -253,7 +263,7 @@ impl UrbanMesh {
 
     /// Surface horizontale ou inclinée, texture projetée selon deux axes
     /// du plan (`u_axis`, `v_axis` : vecteurs unitaires XZ).
-    fn surface(&mut self, points: &[[f32; 3]], u_axis: [f32; 3], v_axis: [f32; 3], layer: Layer, tint: [f32; 3], facing: [f32; 3]) {
+    pub(crate) fn surface(&mut self, points: &[[f32; 3]], u_axis: [f32; 3], v_axis: [f32; 3], layer: Layer, tint: [f32; 3], facing: [f32; 3]) {
         let [um, vm] = layer.size_m();
         let uvs: Vec<[f32; 2]> = points.iter().map(|p| [dot(*p, u_axis) / um, dot(*p, v_axis) / vm]).collect();
         self.polygon(points, &uvs, layer, tint, facing);
@@ -320,6 +330,14 @@ struct Piece {
     b: [f32; 2],
     /// Demi-largeur chaussée + trottoir.
     reach: f32,
+    /// La route dessert-elle les parcelles (pas une voie rapide) ?
+    serves: bool,
+    /// Demi-largeur du terre-plein planté (boulevards), 0 sinon.
+    median: f32,
+    /// Abscisses curvilignes des deux bouts du morceau, et longueur de la
+    /// route : le terre-plein s'arrête avant les carrefours.
+    s: [f32; 2],
+    length: f32,
 }
 
 /// Index spatial des chaussées : la route la plus proche d'un point.
@@ -330,6 +348,10 @@ pub struct RoadIndex {
 }
 
 const BUCKET_M: f32 = 32.0;
+
+/// Pas d'arbre sur le terre-plein à moins de cette distance d'un bout de
+/// boulevard (le carrefour et son élargissement).
+const MEDIAN_END_M: f32 = 22.0;
 
 /// Résultat d'une requête : point le plus proche de l'axe, distance, portée
 /// (demi-chaussée + trottoir).
@@ -345,9 +367,17 @@ impl RoadIndex {
     pub fn new(strips: &[RoadStrip]) -> Self {
         let mut index = Self::default();
         for strip in strips {
-            let reach = strip.half_width_m + sidewalk_width(strip.half_width_m);
+            let profile = crate::roads::Profile::of(strip.spec);
+            let reach = profile.reach();
+            let serves = strip.spec.class.serves_lots();
+            let median = if profile.planted_median { profile.median * 0.5 } else { 0.0 };
+            let length: f32 = strip.points.windows(2).map(|w| dist2([w[0][0], w[0][2]], [w[1][0], w[1][2]])).sum();
+            let mut walked = 0.0;
             for pair in strip.points.windows(2) {
-                let piece = Piece { a: [pair[0][0], pair[0][2]], b: [pair[1][0], pair[1][2]], reach };
+                let (a, b) = ([pair[0][0], pair[0][2]], [pair[1][0], pair[1][2]]);
+                let step = dist2(a, b);
+                let piece = Piece { a, b, reach, serves, median, s: [walked, walked + step], length };
+                walked += step;
                 let id = index.pieces.len() as u32;
                 index.pieces.push(piece);
                 let (x0, x1) = (piece.a[0].min(piece.b[0]) - reach, piece.a[0].max(piece.b[0]) + reach);
@@ -372,6 +402,9 @@ impl RoadIndex {
             for bz in bz0..=bz1 {
                 for &id in self.buckets.get(&(bx, bz)).map_or(&[][..], Vec::as_slice) {
                     let piece = self.pieces[id as usize];
+                    if !piece.serves {
+                        continue;
+                    }
                     let q = closest_on_segment(p, piece.a, piece.b);
                     let d = dist2(p, q);
                     if d <= radius && best.is_none_or(|b| d < b.distance) {
@@ -381,6 +414,24 @@ impl RoadIndex {
             }
         }
         best
+    }
+
+    /// `p` est-il sur le terre-plein planté d'un boulevard, à plus de
+    /// `margin` mètres de ses bordures ?
+    #[must_use]
+    pub fn in_median(&self, p: [f32; 2], margin: f32) -> bool {
+        let (bx, bz) = ((p[0] / BUCKET_M).floor() as i32, (p[1] / BUCKET_M).floor() as i32);
+        self.buckets.get(&(bx, bz)).is_some_and(|ids| {
+            ids.iter().any(|&id| {
+                let piece = self.pieces[id as usize];
+                let q = closest_on_segment(p, piece.a, piece.b);
+                let t = dist2(piece.a, q) / dist2(piece.a, piece.b).max(1e-6);
+                let s = piece.s[0] + (piece.s[1] - piece.s[0]) * t;
+                // Loin des bouts : aux carrefours, le terre-plein laisse place à la chaussée.
+                let interior = s > MEDIAN_END_M && s < piece.length - MEDIAN_END_M;
+                piece.median > margin && interior && dist2(p, q) < piece.median - margin
+            })
+        })
     }
 
     /// Distance de `p` au bord extérieur du trottoir le plus proche (négative
@@ -848,6 +899,9 @@ fn building_dice(tile: TileId) -> Dice {
 #[must_use]
 pub fn tree_allowed(world: &World, roads: &RoadIndex, x: f32, z: f32, tile: TileId) -> bool {
     let grid = world.zoning().grid();
+    if roads.in_median([x, z], 0.8) {
+        return true;
+    }
     let clearance = roads.clearance([x, z], 12.0);
     if clearance < STREET_TREE_CLEARANCE.0 {
         return false;
@@ -1070,7 +1124,13 @@ pub fn street_tree_spots(world: &World, strips: &[RoadStrip]) -> Vec<(TreeSpot, 
     for strip in strips {
         let mut dice = Dice(hash(u64::from(strip.nodes[0]) << 32 | u64::from(strip.nodes[1])));
         let species = dice.pick(&[Species::Oak, Species::Oak, Species::Birch]);
-        let offset = strip.half_width_m + sidewalk_width(strip.half_width_m) + 0.95;
+        let profile = crate::roads::Profile::of(strip.spec);
+        // Alignements derrière les trottoirs, et sur le terre-plein planté.
+        let mut offsets: Vec<f32> = Vec::new();
+        if profile.sidewalk > 0.0 {
+            offsets.push(profile.reach() + 0.95);
+        }
+        let median_trees = profile.planted_median;
         let mut next = STREET_TREE_SPACING_M * 0.5;
         let mut walked = 0.0;
         for pair in strip.points.windows(2) {
@@ -1083,8 +1143,12 @@ pub fn street_tree_spots(world: &World, strips: &[RoadStrip]) -> Vec<(TreeSpot, 
             while next <= walked + len {
                 let t = next - walked;
                 let p = [a[0] + dir[0] * t, a[1] + dir[1] * t];
-                for side in [-1.0f32, 1.0] {
-                    let (x, z) = (p[0] - dir[1] * offset * side, p[1] + dir[0] * offset * side);
+                let mut placements: Vec<f32> = offsets.iter().flat_map(|o| [-*o, *o]).collect();
+                if median_trees {
+                    placements.push(0.0);
+                }
+                for offset in placements {
+                    let (x, z) = (p[0] - dir[1] * offset, p[1] + dir[0] * offset);
                     if x < 0.0 || z < 0.0 {
                         continue;
                     }
@@ -1104,163 +1168,6 @@ pub fn street_tree_spots(world: &World, strips: &[RoadStrip]) -> Vec<(TreeSpot, 
         }
     }
     spots
-}
-
-/// Chaussées texturées (marquages), trottoirs surélevés avec bordures, et
-/// carrefours. Les trottoirs s'interrompent aux carrefours (pas de trottoir
-/// qui traverse la route d'à côté) ; une dalle d'asphalte nu couvre le
-/// croisement pour cacher les marquages qui s'y chevauchent.
-#[must_use]
-pub fn road_mesh(world: &World, strips: &[RoadStrip]) -> UrbanMesh {
-    let mut mesh = UrbanMesh::default();
-    // Degré et tangentes de chaque nœud.
-    let mut ends: HashMap<u32, Vec<(usize, bool)>> = HashMap::new();
-    for (i, strip) in strips.iter().enumerate() {
-        ends.entry(strip.nodes[0]).or_default().push((i, true));
-        ends.entry(strip.nodes[1]).or_default().push((i, false));
-    }
-    let tangent = |strip: &RoadStrip, start: bool| -> [f32; 2] {
-        let n = strip.points.len();
-        let (a, b) = if start { (strip.points[0], strip.points[1.min(n - 1)]) } else { (strip.points[n - 1], strip.points[n.saturating_sub(2)]) };
-        let d = [b[0] - a[0], b[2] - a[2]];
-        let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-6);
-        [d[0] / l, d[1] / l]
-    };
-    // Recul des trottoirs à chaque extrémité (0 si la route continue tout droit).
-    let mut junctions = Vec::new();
-    let mut trims = vec![[0.0f32; 2]; strips.len()];
-    for list in ends.values() {
-        let is_junction = match list.as_slice() {
-            [_] => false,
-            [(i, si), (j, sj)] => {
-                let (ta, tb) = (tangent(&strips[*i], *si), tangent(&strips[*j], *sj));
-                ta[0] * tb[0] + ta[1] * tb[1] > -0.94
-            }
-            _ => true,
-        };
-        if !is_junction {
-            continue;
-        }
-        let widest = list.iter().map(|(i, _)| strips[*i].half_width_m).fold(0.0, f32::max);
-        for (i, start) in list {
-            let trim = widest + sidewalk_width(widest) + 0.5;
-            trims[*i][usize::from(!*start)] = trim;
-        }
-        let (i, start) = list[0];
-        let p = if start { strips[i].points[0] } else { *strips[i].points.last().unwrap_or(&strips[i].points[0]) };
-        let y = list
-            .iter()
-            .map(|(k, s)| {
-                let pts = &strips[*k].points;
-                if *s { pts[0][1] } else { pts[pts.len() - 1][1] }
-            })
-            .fold(f32::NEG_INFINITY, f32::max);
-        junctions.push(([p[0], y, p[2]], widest + 0.3));
-    }
-
-    for (strip, trim) in strips.iter().zip(&trims) {
-        road_ribbon(world, &mut mesh, strip, *trim);
-    }
-    for (center, radius) in junctions {
-        let n = 20;
-        let pts: Vec<[f32; 3]> = (0..n)
-            .map(|k| {
-                let a = k as f32 / n as f32 * std::f32::consts::TAU;
-                [center[0] + radius * a.cos(), center[1] + 0.02, center[2] + radius * a.sin()]
-            })
-            .collect();
-        // Asphalte nu : la bande sans marquage de la couche 2 voies.
-        let uvs: Vec<[f32; 2]> = pts
-            .iter()
-            .map(|p| [0.27 + (p[0] - center[0]) / radius * 0.12, (p[2] - center[2]) / 8.0])
-            .collect();
-        mesh.polygon(&pts, &uvs, Layer::Road2, WHITE, [0.0, 1.0, 0.0]);
-    }
-    mesh
-}
-
-/// Une chaussée et ses deux trottoirs. `trim` : longueur sans trottoir au
-/// début et à la fin (carrefours).
-fn road_ribbon(world: &World, mesh: &mut UrbanMesh, strip: &RoadStrip, trim: [f32; 2]) {
-    let pts = &strip.points;
-    if pts.len() < 2 {
-        return;
-    }
-    let hw = strip.half_width_m;
-    let sw = sidewalk_width(hw);
-    let layer = if strip.lanes >= 4 { Layer::Road4 } else { Layer::Road2 };
-    let v_len = layer.size_m()[1];
-    // Normales en onglet : moyenne des perpendiculaires des tronçons voisins.
-    let n = pts.len();
-    let mut normals = Vec::with_capacity(n);
-    let mut arc = Vec::with_capacity(n);
-    let mut s = 0.0;
-    for i in 0..n {
-        if i > 0 {
-            s += dist2([pts[i - 1][0], pts[i - 1][2]], [pts[i][0], pts[i][2]]);
-        }
-        arc.push(s);
-        let prev = pts[i.saturating_sub(1)];
-        let next = pts[(i + 1).min(n - 1)];
-        let d = [next[0] - prev[0], next[2] - prev[2]];
-        let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-6);
-        normals.push([-d[1] / l, d[0] / l]);
-    }
-    let total = s;
-    let off = |i: usize, w: f32, dy: f32| [pts[i][0] + normals[i][0] * w, pts[i][1] + dy, pts[i][2] + normals[i][1] * w];
-    for i in 0..n - 1 {
-        let (va, vb) = (arc[i] / v_len, arc[i + 1] / v_len);
-        mesh.polygon(
-            &[off(i, -hw, 0.0), off(i, hw, 0.0), off(i + 1, hw, 0.0), off(i + 1, -hw, 0.0)],
-            &[[0.0, va], [1.0, va], [1.0, vb], [0.0, vb]],
-            layer,
-            WHITE,
-            [0.0, 1.0, 0.0],
-        );
-    }
-    // Trottoirs, découpés aux carrefours : on rééchantillonne la polyligne
-    // entre `trim[0]` et `total - trim[1]`.
-    let (s0, s1) = (trim[0], total - trim[1]);
-    if s1 - s0 < 1.0 {
-        return;
-    }
-    let sample = |s: f32| -> ([f32; 3], [f32; 2]) {
-        let i = arc.partition_point(|&a| a < s).clamp(1, n - 1);
-        let t = ((s - arc[i - 1]) / (arc[i] - arc[i - 1]).max(1e-6)).clamp(0.0, 1.0);
-        let p = [
-            pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * t,
-            pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * t,
-            pts[i - 1][2] + (pts[i][2] - pts[i - 1][2]) * t,
-        ];
-        let nx = normals[i - 1][0] + (normals[i][0] - normals[i - 1][0]) * t;
-        let nz = normals[i - 1][1] + (normals[i][1] - normals[i - 1][1]) * t;
-        let l = (nx * nx + nz * nz).sqrt().max(1e-6);
-        (p, [nx / l, nz / l])
-    };
-    let mut stations: Vec<f32> = vec![s0];
-    stations.extend(arc.iter().copied().filter(|&a| a > s0 && a < s1));
-    stations.push(s1);
-    let samples: Vec<_> = stations.iter().map(|&s| sample(s)).collect();
-    for side in [-1.0f32, 1.0] {
-        for k in 0..samples.len() - 1 {
-            let ((pa, na), (pb, nb)) = (samples[k], samples[k + 1]);
-            let at = |p: [f32; 3], nrm: [f32; 2], w: f32, dy: f32| [p[0] + nrm[0] * w * side, p[1] + dy, p[2] + nrm[1] * w * side];
-            let top = CURB_M;
-            // Dessus du trottoir.
-            let outward = [na[0] * side, 0.0, na[1] * side];
-            let quad = [at(pa, na, hw, top), at(pa, na, hw + sw, top), at(pb, nb, hw + sw, top), at(pb, nb, hw, top)];
-            mesh.surface(&quad, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], Layer::Sidewalk, WHITE, [0.0, 1.0, 0.0]);
-            // Bordure côté chaussée (regarde la chaussée).
-            let curb = [at(pa, na, hw, 0.0), at(pb, nb, hw, 0.0), at(pb, nb, hw, top), at(pa, na, hw, top)];
-            mesh.surface(&curb, [outward[2], 0.0, -outward[0]], [0.0, 1.0, 0.0], Layer::Concrete, [0.95, 0.95, 0.95], scale(outward, -1.0));
-            // Talus extérieur jusqu'au terrain (la chaussée est surélevée).
-            let (ga, gb) = (at(pa, na, hw + sw, 0.0), at(pb, nb, hw + sw, 0.0));
-            let ground_a = ground_altitude_m(world, ga[0], ga[2]) - 0.6;
-            let ground_b = ground_altitude_m(world, gb[0], gb[2]) - 0.6;
-            let skirt = [[ga[0], ground_a, ga[2]], [gb[0], ground_b, gb[2]], at(pb, nb, hw + sw, top), at(pa, na, hw + sw, top)];
-            mesh.surface(&skirt, [outward[2], 0.0, -outward[0]], [0.0, 1.0, 0.0], Layer::Concrete, [0.8, 0.8, 0.78], outward);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1284,7 +1191,7 @@ mod tests {
             let entry = format!("(\"{name}\", {w:?}, {h:?})");
             assert!(script.contains(&entry), "couche {name} absente ou de taille différente : {entry}");
         }
-        assert_eq!(Layer::Door.index(), LAYER_COUNT - 1);
+        assert_eq!(Layer::Beacon.index(), LAYER_COUNT - 1);
     }
 
     #[test]
@@ -1374,7 +1281,7 @@ mod tests {
                 continue;
             }
             let clearance = roads.clearance([x, z], 12.0);
-            assert!(clearance >= 0.6, "arbre sur la route en {x} {z}");
+            assert!(clearance >= 0.6 || roads.in_median([x, z], 0.8), "arbre sur la route en {x} {z}");
             if clearance < 2.0 {
                 street += 1;
             }
@@ -1404,16 +1311,4 @@ mod tests {
         assert_eq!(buildings_signature(&world, 0, 0, 128, 128), buildings_signature(&world, 0, 0, 128, 128));
     }
 
-    #[test]
-    fn roads_have_sidewalks_and_valid_layers() {
-        let world = city();
-        let strips = scene::roads(&world);
-        let mesh = road_mesh(&world, &strips);
-        assert!(mesh.is_sane());
-        let layers: std::collections::HashSet<usize> =
-            mesh.colors.iter().map(|c| (c[3] * LAYER_ENCODING).round() as usize).collect();
-        for layer in [Layer::Road4, Layer::Sidewalk, Layer::Concrete] {
-            assert!(layers.contains(&layer.index()), "{layer:?} manquant");
-        }
-    }
 }
