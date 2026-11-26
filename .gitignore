@@ -7,3 +7,4 @@ citymayor-*.png
 
 # fichiers intermédiaires de tools/blender/make_trees.py
 crates/render/assets/trees/.tmp/
+tools/blender/sources/urban/

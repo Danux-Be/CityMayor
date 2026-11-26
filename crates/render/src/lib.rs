@@ -30,6 +30,7 @@
 
 pub mod nature;
 pub mod scene;
+pub mod urban;
 
 #[cfg(feature = "viewer")]
 pub mod viewer;

@@ -44,13 +44,16 @@ use bevy::shader::ShaderRef;
 
 use sim_core::{FixedStepClock, World, ZoneType};
 
-use crate::{nature, scene};
+use std::collections::HashMap;
+
+use crate::{nature, scene, urban};
 
 /// Ticks simulés avant d'ouvrir la fenêtre : la ville est déjà peuplée.
 const PRESIMULATION_TICKS: u32 = 2_400;
 
 type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
 type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
+type UrbanMaterial = ExtendedMaterial<StandardMaterial, UrbanExtension>;
 
 /// Extension du matériau standard : six couches de sol dans un tableau de
 /// textures, mélangées par `shaders/terrain.wesl`.
@@ -84,6 +87,22 @@ impl MaterialExtension for WaterExtension {
     }
 }
 
+/// Extension du matériau standard : façades, toits et voirie dans un tableau
+/// de textures (`urban::LAYER_NAMES`), couche choisie par sommet
+/// (`shaders/urban.wesl`).
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+struct UrbanExtension {
+    #[texture(100, dimension = "2d_array")]
+    #[sampler(101)]
+    layers: Handle<Image>,
+}
+
+impl MaterialExtension for UrbanExtension {
+    fn fragment_shader() -> ShaderRef {
+        "embedded://city_render/shaders/urban.wesl".into()
+    }
+}
+
 /// Lancée par le binaire `city-viewer`.
 pub fn run() {
     let mut world = scene::demo_city();
@@ -103,13 +122,16 @@ pub fn run() {
     }));
     embedded_asset!(app, "shaders/terrain.wesl");
     embedded_asset!(app, "shaders/water.wesl");
+    embedded_asset!(app, "shaders/urban.wesl");
     app.add_plugins((
         MaterialPlugin::<TerrainMaterial>::default(),
         MaterialPlugin::<WaterMaterial>::default(),
+        MaterialPlugin::<UrbanMaterial>::default(),
     ))
     .insert_resource(ClearColor(srgb(nature::HORIZON_COLOR)))
     .insert_resource(Sim::new(world))
     .insert_resource(Handles::default())
+    .insert_resource(City::default())
     .insert_resource(Tour::new(tour))
     // `ScreenshotPlugin` est déjà fourni par `DefaultPlugins` en Bevy 0.20.
     .add_systems(Startup, setup)
@@ -171,8 +193,93 @@ impl Sim {
 
 #[derive(Resource, Default)]
 struct Handles {
-    buildings: Handle<Mesh>,
     roads: Handle<Mesh>,
+    urban: Handle<UrbanMaterial>,
+}
+
+/// Côté d'un morceau de ville (tuiles) : un maillage par morceau, reconstruit
+/// seulement quand ses bâtiments changent.
+const CITY_CHUNK_TILES: u32 = 16;
+
+/// Morceaux de ville construits : empreinte des bâtiments, entité, maillage.
+#[derive(Resource, Default)]
+struct City {
+    roads: urban::RoadIndex,
+    road_segments: u32,
+    chunks: HashMap<(u32, u32), CityChunk>,
+}
+
+/// Empreinte des bâtiments d'un morceau, et son entité si elle a de la géométrie.
+type CityChunk = (u64, Option<(Entity, Handle<Mesh>)>);
+
+impl City {
+    /// Reconstruit la voirie si le réseau a changé, puis les morceaux dont les
+    /// bâtiments (ou la voirie) ont changé. Renvoie les rectangles (m, XZ)
+    /// reconstruits : les arbres de la ville n'y sont réévalués que là.
+    fn refresh(
+        &mut self,
+        world: &World,
+        commands: &mut Commands,
+        meshes: &mut Assets<Mesh>,
+        handles: &Handles,
+    ) -> Vec<[f32; 4]> {
+        let mut changed = Vec::new();
+        let size = world.config().tile_size_m as f32;
+        let segments = world.roads().live_segments();
+        let roads_changed = segments != self.road_segments || self.chunks.is_empty();
+        if roads_changed {
+            let strips = scene::roads(world);
+            self.roads = urban::RoadIndex::new(&strips);
+            self.road_segments = segments;
+            if let Some(mut mesh) = meshes.get_mut(&handles.roads) {
+                *mesh = urban_mesh(urban::road_mesh(world, &strips), RenderAssetUsages::default());
+            }
+        }
+        let grid = world.zoning().grid();
+        let (w, h) = (grid.width(), grid.height());
+        for cy in (0..h).step_by(CITY_CHUNK_TILES as usize) {
+            for cx in (0..w).step_by(CITY_CHUNK_TILES as usize) {
+                // Une tuile de marge : la parcelle dépend des voisines.
+                let signature = urban::buildings_signature(
+                    world,
+                    cx.saturating_sub(1),
+                    cy.saturating_sub(1),
+                    cx + CITY_CHUNK_TILES + 1,
+                    cy + CITY_CHUNK_TILES + 1,
+                );
+                let entry = self.chunks.entry((cx, cy)).or_insert((u64::MAX, None));
+                if entry.0 == signature && !roads_changed {
+                    continue;
+                }
+                entry.0 = signature;
+                // Marge d'une tuile : les arbres voisins dépendent des parcelles.
+                changed.push([
+                    cx as f32 * size - size,
+                    cy as f32 * size - size,
+                    (cx + CITY_CHUNK_TILES) as f32 * size + size,
+                    (cy + CITY_CHUNK_TILES) as f32 * size + size,
+                ]);
+                let data = urban::buildings_in(world, &self.roads, cx, cy, cx + CITY_CHUNK_TILES, cy + CITY_CHUNK_TILES);
+                if let Some((entity, handle)) = entry.1.take() {
+                    commands.entity(entity).despawn();
+                    meshes.remove(&handle);
+                }
+                if data.is_empty() {
+                    continue;
+                }
+                let handle = meshes.add(urban_mesh(data, RenderAssetUsages::RENDER_WORLD));
+                let entity = commands
+                    .spawn((Mesh3d(handle.clone()), MeshMaterial3d(handles.urban.clone()), Transform::default()))
+                    .id();
+                entry.1 = Some((entity, handle));
+            }
+        }
+        changed
+    }
+}
+
+fn urban_mesh(data: urban::UrbanMesh, usage: RenderAssetUsages) -> Mesh {
+    mesh(data.positions, data.normals, Some(data.colors), Some(data.uvs), data.indices, usage)
 }
 
 /// Niveaux construits à la demande près de la caméra (`stream_forest`).
@@ -273,7 +380,7 @@ fn mesh(
     mesh
 }
 
-/// Tableau de textures des six couches, mipmaps générés au chargement.
+/// Tableau de textures des six couches du sol.
 fn terrain_layers() -> Image {
     const SOURCES: [&[u8]; nature::LAYER_COUNT] = [
         include_bytes!("../assets/textures/0_prairie.jpg"),
@@ -283,10 +390,33 @@ fn terrain_layers() -> Image {
         include_bytes!("../assets/textures/4_sable.jpg"),
         include_bytes!("../assets/textures/5_neige.jpg"),
     ];
+    texture_array("terrain_layers", &SOURCES, &nature::LAYER_NAMES)
+}
+
+/// Tableau de textures urbaines (façades, toits, voirie), rendues par
+/// `tools/blender/make_buildings.py`.
+fn urban_layers() -> Image {
+    macro_rules! layers {
+        ($($name:literal),* $(,)?) => {
+            [$(include_bytes!(concat!("../assets/urban/", $name, ".jpg")).as_slice()),*]
+        };
+    }
+    const SOURCES: [&[u8]; urban::LAYER_COUNT] = layers!(
+        "00_brique_fenetres", "01_brique", "02_enduit_fenetres", "03_enduit",
+        "04_bardage_fenetres", "05_bardage", "06_immeuble", "07_vitrine", "08_bureaux",
+        "09_industrie", "10_tuiles", "11_ardoises", "12_toit_tole", "13_toit_plat",
+        "14_route_2_voies", "15_route_4_voies", "16_trottoir", "17_beton", "18_pelouse",
+        "19_porte",
+    );
+    texture_array("urban_layers", &SOURCES, &urban::LAYER_NAMES)
+}
+
+/// Tableau de textures JPEG 1024², mipmaps calculés au chargement.
+fn texture_array(label: &'static str, sources: &[&[u8]], names: &[&str]) -> Image {
     const SIZE: u32 = 1024;
     let mip_levels = SIZE.ilog2() + 1;
     let mut data = Vec::new();
-    for (index, bytes) in SOURCES.iter().enumerate() {
+    for (index, bytes) in sources.iter().enumerate() {
         let decoded = Image::from_buffer(
             bytes,
             ImageType::Extension("jpg"),
@@ -295,7 +425,7 @@ fn terrain_layers() -> Image {
             ImageSampler::Default,
             RenderAssetUsages::RENDER_WORLD,
         )
-        .unwrap_or_else(|e| panic!("texture {} illisible : {e}", nature::LAYER_NAMES[index]));
+        .unwrap_or_else(|e| panic!("texture {} illisible : {e}", names[index]));
         let rgba = decoded
             .convert(TextureFormat::Rgba8UnormSrgb)
             .expect("conversion RGBA8");
@@ -313,35 +443,35 @@ fn terrain_layers() -> Image {
     Image {
         data: Some(data),
         texture_descriptor: TextureDescriptor {
-        label: Some("terrain_layers"),
-        size: Extent3d {
-            width: SIZE,
-            height: SIZE,
-            depth_or_array_layers: nature::LAYER_COUNT as u32,
+            label: Some(label),
+            size: Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: sources.len() as u32,
+            },
+            mip_level_count: mip_levels,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
         },
-        mip_level_count: mip_levels,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8UnormSrgb,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-        view_formats: &[],
-    },
-    texture_view_descriptor: Some(TextureViewDescriptor {
-        dimension: Some(TextureViewDimension::D2Array),
+        texture_view_descriptor: Some(TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D2Array),
+            ..default()
+        }),
+        sampler: ImageSampler::Descriptor(ImageSamplerDescriptor {
+            address_mode_u: ImageAddressMode::Repeat,
+            address_mode_v: ImageAddressMode::Repeat,
+            address_mode_w: ImageAddressMode::Repeat,
+            mag_filter: ImageFilterMode::Linear,
+            min_filter: ImageFilterMode::Linear,
+            mipmap_filter: ImageFilterMode::Linear,
+            anisotropy_clamp: 16,
+            ..default()
+        }),
+        asset_usage: RenderAssetUsages::RENDER_WORLD,
         ..default()
-    }),
-    sampler: ImageSampler::Descriptor(ImageSamplerDescriptor {
-        address_mode_u: ImageAddressMode::Repeat,
-        address_mode_v: ImageAddressMode::Repeat,
-        address_mode_w: ImageAddressMode::Repeat,
-        mag_filter: ImageFilterMode::Linear,
-        min_filter: ImageFilterMode::Linear,
-        mipmap_filter: ImageFilterMode::Linear,
-        anisotropy_clamp: 16,
-        ..default()
-    }),
-    asset_usage: RenderAssetUsages::RENDER_WORLD,
-    ..default()
     }
 }
 
@@ -415,8 +545,10 @@ fn setup(
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     mut water_materials: ResMut<Assets<WaterMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut urban_materials: ResMut<Assets<UrbanMaterial>>,
     sim: Res<Sim>,
     mut handles: ResMut<Handles>,
+    mut city: ResMut<City>,
 ) {
     let world = &sim.world;
     let static_usage = RenderAssetUsages::RENDER_WORLD;
@@ -471,6 +603,20 @@ fn setup(
     ));
     }
 
+    // --- la ville (reconstruite par morceaux quand elle change)
+    handles.urban = urban_materials.add(UrbanMaterial {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.8,
+            reflectance: 0.3,
+            ..default()
+        },
+        extension: UrbanExtension { layers: images.add(urban_layers()) },
+    });
+    handles.roads = meshes.add(urban_mesh(urban::UrbanMesh::default(), RenderAssetUsages::default()));
+    commands.spawn((Mesh3d(handles.roads.clone()), MeshMaterial3d(handles.urban.clone()), Transform::default()));
+    city.refresh(world, &mut commands, &mut meshes, &handles);
+
     // --- forêts du décor (une entité par cellule de 1 km : culling)
     // Arbres : un seul matériau, l'atlas (cartes de feuillage, écorces,
     // imposteurs) détouré par son alpha. Pas de « double_sided » : les deux
@@ -498,39 +644,29 @@ fn setup(
                 .map(|c| c.into_iter().map(|s| (s, None)).collect()),
         );
     }
-    cells.extend(
-        nature::play_area_tree_cells(world, 256.0)
-            .into_iter()
-            .map(|c| c.into_iter().map(|(s, t)| (s, Some(t))).collect()),
-    );
+    // Zone jouable : arbres naturels + alignements le long des rues, rangés
+    // dans les mêmes cellules de 256 m.
+    let mut play_cells = nature::play_area_tree_cells(world, 256.0);
+    let columns = (nature::play_size_m(world).0 / 256.0).ceil() as usize;
+    for (spot, tile) in urban::street_tree_spots(world, &scene::roads(world)) {
+        let index = (spot.base[2] / 256.0) as usize * columns + (spot.base[0] / 256.0) as usize;
+        if let Some(cell) = play_cells.get_mut(index) {
+            cell.push((spot, tile));
+        }
+    }
+    cells.extend(play_cells.into_iter().map(|c| c.into_iter().map(|(s, t)| (s, Some(t))).collect()));
     for spots in cells {
         let all: Vec<_> = spots.iter().map(|(s, _)| *s).collect();
         let origin = nature::spots_center(&all);
-        let city = spots.first().is_some_and(|(_, t)| t.is_some());
-        let current = if city { city_spots(world, &spots) } else { all };
+        let in_city = spots.first().is_some_and(|(_, t)| t.is_some());
+        let current = if in_city { city_spots(world, &city.roads, &spots) } else { all };
         let chunk = nature::build_trees(&current, nature::TreeLod::Silhouette, &forest.models, origin);
         // Ville : mesh modifiable (la ville empiète) ; décor : GPU seulement.
-        let silhouette = meshes.add(if city { tree_mesh(chunk) } else { static_tree_mesh(chunk) });
+        let silhouette = meshes.add(if in_city { tree_mesh(chunk) } else { static_tree_mesh(chunk) });
         spawn_tree_entity(&mut commands, silhouette.clone(), &tree_mat, nature::TreeLod::Silhouette, Vec3::from(origin));
         forest.cells.push(ForestCell { spots, current, origin, silhouette, streamed: [None, None] });
     }
     commands.insert_resource(forest);
-
-    // --- la ville (reconstruite quand elle change)
-    handles.buildings = meshes.add(buildings_mesh(&scene::buildings(world)));
-    handles.roads = meshes.add(roads_mesh(&scene::roads(world)));
-    let building_mat = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        perceptual_roughness: 0.75,
-        ..default()
-    });
-    let road_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.17, 0.17, 0.19),
-        perceptual_roughness: 0.85,
-        ..default()
-    });
-    commands.spawn((Mesh3d(handles.buildings.clone()), MeshMaterial3d(building_mat), Transform::default()));
-    commands.spawn((Mesh3d(handles.roads.clone()), MeshMaterial3d(road_mat), Transform::default()));
 
     // --- ciel : dôme dégradé qui suit la caméra, hors brouillard
     let (sky_positions, sky_colors, sky_indices) = nature::sky_dome(24, 48);
@@ -753,6 +889,7 @@ fn refresh_city(
     time: Res<Time>,
     mut meshes: ResMut<Assets<Mesh>>,
     handles: Res<Handles>,
+    mut city: ResMut<City>,
     mut forest: ResMut<Forest>,
     mut commands: Commands,
     mut built_signature: Local<Option<(u32, u32, u32)>>,
@@ -766,17 +903,17 @@ fn refresh_city(
     *built_signature = Some(signature);
     *since_last = 0.0;
     let world = &sim.world;
-    if let Some(mut mesh) = meshes.get_mut(&handles.buildings) {
-        *mesh = buildings_mesh(&scene::buildings(world));
-    }
-    if let Some(mut mesh) = meshes.get_mut(&handles.roads) {
-        *mesh = roads_mesh(&scene::roads(world));
-    }
+    let changed = city.refresh(world, &mut commands, &mut meshes, &handles);
     // Forêt : seules les cellules de la ville dont les arbres ont changé. Les
     // niveaux streamés sont libérés ; `stream_forest` les reconstruit.
     let forest = &mut *forest;
-    for cell in forest.cells.iter_mut().filter(|c| c.is_city()) {
-        let spots = city_spots(world, &cell.spots);
+    let touched = |cell: &ForestCell| {
+        cell.spots.iter().any(|(s, _)| {
+            changed.iter().any(|r| s.base[0] >= r[0] && s.base[0] < r[2] && s.base[2] >= r[1] && s.base[2] < r[3])
+        })
+    };
+    for cell in forest.cells.iter_mut().filter(|c| c.is_city() && touched(c)) {
+        let spots = city_spots(world, &city.roads, &cell.spots);
         if spots.len() == cell.current.len() {
             continue;
         }
@@ -793,10 +930,19 @@ fn refresh_city(
     }
 }
 
-/// Arbres d'une cellule de la ville qui ont encore leur place.
-fn city_spots(world: &World, spots: &[(nature::TreeSpot, Option<sim_core::TileId>)]) -> Vec<nature::TreeSpot> {
-    let with_tiles: Vec<_> = spots.iter().filter_map(|(s, t)| t.map(|t| (*s, t))).collect();
-    nature::city_trees(world, &with_tiles)
+/// Arbres d'une cellule de la ville qui ont encore leur place : terrains
+/// libres, accotements, jardins de derrière (`urban::tree_allowed`).
+fn city_spots(
+    world: &World,
+    roads: &urban::RoadIndex,
+    spots: &[(nature::TreeSpot, Option<sim_core::TileId>)],
+) -> Vec<nature::TreeSpot> {
+    spots
+        .iter()
+        .filter_map(|(s, t)| t.map(|t| (*s, t)))
+        .filter(|(s, t)| urban::tree_allowed(world, roads, s.base[0], s.base[2], *t))
+        .map(|(s, _)| s)
+        .collect()
 }
 
 /// Construit/libère le modèle complet et le modèle allégé des cellules selon
@@ -898,8 +1044,10 @@ impl Tour {
 }
 
 /// (nom, point visé relatif au centre (x, z), lacet, inclinaison, distance).
-const TOUR_VIEWS: [(&str, f32, f32, f32, f32, f32); 8] = [
+const TOUR_VIEWS: [(&str, f32, f32, f32, f32, f32); 10] = [
     ("ville", 0.0, 0.0, 0.8, 0.55, 900.0),
+    ("rue", -0.2, -0.3, 0.6, 0.30, 70.0),
+    ("quartier", -0.2, -0.3, 1.2, 0.55, 260.0),
     ("berge", 0.02, 0.18, 2.0, 0.32, 160.0),
     ("montagne", -0.6, -0.6, 2.4, 0.16, 900.0),
     ("fleuve", 0.15, -0.1, 2.3, 0.30, 420.0),
@@ -997,121 +1145,5 @@ fn screenshot_on_key(
         commands
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk(name));
-    }
-}
-
-// ------------------------------------------------------------------- meshes
-// ------------------------------------------------------------------- meshes
-
-fn buildings_mesh(blocks: &[scene::BuildingBlock]) -> Mesh {
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(blocks.len() * 24);
-    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(blocks.len() * 24);
-    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(blocks.len() * 24);
-    let mut indices: Vec<u32> = Vec::with_capacity(blocks.len() * 36);
-
-    for block in blocks {
-        let color = scene::kind_color(block.kind);
-        push_box(
-            &mut positions,
-            &mut normals,
-            &mut colors,
-            &mut indices,
-            block.min,
-            block.max,
-            [color[0], color[1], color[2], 1.0],
-        );
-    }
-
-    let mut mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-    mesh.insert_indices(Indices::U32(indices));
-    mesh
-}
-
-fn roads_mesh(strips: &[scene::RoadStrip]) -> Mesh {
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-
-    for strip in strips {
-        for pair in strip.points.windows(2) {
-            let (a, b) = (pair[0], pair[1]);
-            let dir = [b[0] - a[0], b[2] - a[2]];
-            let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
-            if len < 1e-3 {
-                continue;
-            }
-            let perp = [
-                -dir[1] / len * strip.half_width_m,
-                dir[0] / len * strip.half_width_m,
-            ];
-            let base = positions.len() as u32;
-            let corners = [
-                [a[0] - perp[0], a[1], a[2] - perp[1]],
-                [a[0] + perp[0], a[1], a[2] + perp[1]],
-                [b[0] + perp[0], b[1], b[2] + perp[1]],
-                [b[0] - perp[0], b[1], b[2] - perp[1]],
-            ];
-            for corner in corners {
-                positions.push(corner);
-                normals.push([0.0, 1.0, 0.0]);
-            }
-            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-        }
-    }
-
-    let mut mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-    mesh.insert_indices(Indices::U32(indices));
-    mesh
-}
-
-fn push_box(
-    positions: &mut Vec<[f32; 3]>,
-    normals: &mut Vec<[f32; 3]>,
-    colors: &mut Vec<[f32; 4]>,
-    indices: &mut Vec<u32>,
-    min: [f32; 3],
-    max: [f32; 3],
-    color: [f32; 4],
-) {
-    let corners = [
-        [min[0], min[1], min[2]],
-        [max[0], min[1], min[2]],
-        [max[0], min[1], max[2]],
-        [min[0], min[1], max[2]],
-        [min[0], max[1], min[2]],
-        [max[0], max[1], min[2]],
-        [max[0], max[1], max[2]],
-        [min[0], max[1], max[2]],
-    ];
-    // (quatre coins, normale) — le sens de winding n'a pas d'importance ici :
-    // le matériau désactive le back-face culling.
-    let faces: [([usize; 4], [f32; 3]); 6] = [
-        ([4, 5, 6, 7], [0.0, 1.0, 0.0]),
-        ([3, 2, 1, 0], [0.0, -1.0, 0.0]),
-        ([0, 1, 5, 4], [0.0, 0.0, -1.0]),
-        ([2, 3, 7, 6], [0.0, 0.0, 1.0]),
-        ([3, 0, 4, 7], [-1.0, 0.0, 0.0]),
-        ([1, 2, 6, 5], [1.0, 0.0, 0.0]),
-    ];
-
-    for (quad, normal) in faces {
-        let base = positions.len() as u32;
-        for corner in quad {
-            positions.push(corners[corner]);
-            normals.push(normal);
-            colors.push(color);
-        }
-        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 }

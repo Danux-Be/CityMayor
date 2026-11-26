@@ -35,8 +35,12 @@ pub const DEMO_MAP_TILES: u32 = 256;
 /// zonage mixte. Vit ici (sans Bevy) pour être testé.
 #[must_use]
 pub fn demo_city() -> World {
+    // Rayon d'accès de 3 tuiles : le premier rang de zonage est à deux tuiles
+    // de l'axe de l'avenue (14 m de chaussée + trottoirs), la tuile entre
+    // les deux sert d'accotement et de jardin de devant.
+    let config = SimConfig { road_access_radius_tiles: 3, ..SimConfig::default() };
     let mut world = World::generated(
-        SimConfig::default(),
+        config,
         0x0C17_CAFE,
         WorldGenParams::default(),
         DEMO_MAP_TILES,
@@ -52,8 +56,8 @@ pub fn demo_city() -> World {
     };
 
     let mut west_ends = Vec::new();
-    for row in 0..17u32 {
-        let y = 24 + row * 12;
+    for row in 0..21u32 {
+        let y = 24 + row * 10;
         // Tronçons secs d'au moins 16 tuiles : le fleuve coupe une avenue en
         // deux tronçons (pas encore de ponts).
         let mut runs = Vec::new();
@@ -82,11 +86,9 @@ pub fn demo_city() -> World {
                 west_ends.push((x0, y));
             }
             for (band, zone) in [
-                (y + 1, ZoneType::Residential),
                 (y + 2, ZoneType::Residential),
                 (y + 3, ZoneType::Residential),
-                (y - 1, ZoneType::Commercial),
-                (y - 2, ZoneType::Industrial),
+                (y - 2, ZoneType::Commercial),
                 (y - 3, ZoneType::Industrial),
             ] {
                 world.queue(Command::ZoneRect {
@@ -150,6 +152,10 @@ pub struct RoadStrip {
     /// Points en mètres, Y = altitude du sol (+ surépaisseur anti z-fighting).
     pub points: Vec<[f32; 3]>,
     pub half_width_m: f32,
+    /// Nombre total de voies (choix du marquage).
+    pub lanes: u8,
+    /// Nœuds de départ et d'arrivée (indices) : carrefours et continuités.
+    pub nodes: [u32; 2],
 }
 
 /// Maillage de terrain prêt à téléverser.
@@ -235,6 +241,8 @@ pub fn roads(world: &World) -> Vec<RoadStrip> {
         strips.push(RoadStrip {
             points,
             half_width_m: lanes * 3.5 * 0.5,
+            lanes: segment.spec.total_lanes(),
+            nodes: [segment.a.raw(), segment.b.raw()],
         });
     }
     strips
