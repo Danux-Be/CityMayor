@@ -13,6 +13,7 @@
 //! [`crate::world::SimEvent::CommandRejected`] : l'UI affiche l'erreur, le joueur
 //! comprend immédiatement pourquoi c'est rouge.
 
+use crate::fixed::Fixed;
 use crate::ids::TileId;
 use crate::road::{Point, RoadError, RoadSpec};
 use crate::zoning::ZoneType;
@@ -99,6 +100,14 @@ pub enum Command {
         to_handle: Point,
         spec: RoadSpec,
     },
+    /// Pose un rond-point de rayon `radius_m` (axe de l'anneau) centré sur
+    /// `center`. Les rues qui y aboutissent se raccordent à ses 8 nœuds
+    /// (aux points cardinaux et diagonaux) par l'accroche habituelle.
+    BuildRoundabout {
+        center: Point,
+        radius_m: Fixed,
+        spec: RoadSpec,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +116,18 @@ pub enum CommandError {
     OutOfBounds,
     /// Le graphe routier a refusé la création (doublon, boucle, spec invalide…).
     Road(RoadError),
+}
+
+impl CommandError {
+    /// Clé du message affiché au joueur (fichiers de langue). `Display` reste
+    /// un texte de diagnostic pour les journaux, jamais montré en jeu.
+    #[must_use]
+    pub const fn message_key(&self) -> &'static str {
+        match self {
+            CommandError::OutOfBounds => "error-out-of-bounds",
+            CommandError::Road(inner) => inner.message_key(),
+        }
+    }
 }
 
 impl core::fmt::Display for CommandError {

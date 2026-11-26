@@ -24,6 +24,8 @@ pub enum BuildingKind {
 }
 
 impl BuildingKind {
+    pub const ALL: [Self; 3] = [Self::Household, Self::Shop, Self::Factory];
+
     #[must_use]
     pub const fn from_zone(zone: ZoneType) -> Option<Self> {
         match zone {
@@ -39,12 +41,14 @@ impl BuildingKind {
         matches!(self, Self::Shop | Self::Factory)
     }
 
+    /// Clé du nom affiché dans les fichiers de langue (`locales/<langue>/`).
+    /// La simulation ne contient aucun texte destiné au joueur.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub const fn message_key(self) -> &'static str {
         match self {
-            Self::Household => "logement",
-            Self::Shop => "commerce",
-            Self::Factory => "usine",
+            Self::Household => "building-kind-household",
+            Self::Shop => "building-kind-shop",
+            Self::Factory => "building-kind-factory",
         }
     }
 

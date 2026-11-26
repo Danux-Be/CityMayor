@@ -92,19 +92,20 @@ impl Overlay {
         matches!(self, Self::Zone | Self::LandValue | Self::RoadAccess)
     }
 
+    /// Clé du nom affiché dans les fichiers de langue.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub const fn message_key(self) -> &'static str {
         match self {
-            Self::Zone => "Zonage",
-            Self::LandValue => "Valeur foncière",
-            Self::RoadAccess => "Desserte routière",
-            Self::Population => "Densité de population",
-            Self::Traffic => "Trafic",
-            Self::Noise => "Bruit",
-            Self::Pollution => "Pollution",
-            Self::ServiceCoverage => "Couverture des services",
-            Self::Electricity => "Électricité",
-            Self::Water => "Eau",
+            Self::Zone => "overlay-zone",
+            Self::LandValue => "overlay-land-value",
+            Self::RoadAccess => "overlay-road-access",
+            Self::Population => "overlay-population",
+            Self::Traffic => "overlay-traffic",
+            Self::Noise => "overlay-noise",
+            Self::Pollution => "overlay-pollution",
+            Self::ServiceCoverage => "overlay-service-coverage",
+            Self::Electricity => "overlay-electricity",
+            Self::Water => "overlay-water",
         }
     }
 }

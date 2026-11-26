@@ -18,5 +18,9 @@
 //! - `OverlaySelector`, `DemandPanel` (RCI), `BudgetPanel` ;
 //! - `CameraInput` (orbite/pan/zoom amortis, focus au clic sur une tuile).
 
+pub mod text;
+
+pub use city_i18n::{Arg, Localizer};
+
 /// Étape de la roadmap à laquelle cette crate devient fonctionnelle.
 pub const PLANNED_ITERATION: u8 = 2;

@@ -33,6 +33,7 @@ use crate::road::{Point, RoadNetwork, RoadSpec};
 use crate::rng::Pcg32;
 use crate::terrain::Terrain;
 use crate::time::{Calendar, Tick};
+use crate::worldgen::{WorldGen, WorldGenParams};
 use crate::zoning::{ZoneType, Zoning};
 
 /// Toute la configuration du cœur de simulation, en un seul objet.
@@ -53,6 +54,10 @@ pub struct SimConfig {
     pub max_slope_cm: i32,
     pub road_access_radius_tiles: i32,
     pub road_snap_radius_m: Fixed,
+    /// Les routes passent par un chantier avant d'ouvrir (durée selon
+    /// `RoadClass::construction_ticks`). `false` : ouverture immédiate
+    /// (scénarios de test, démo pré-construite).
+    pub road_construction: bool,
     pub land_value_budget_per_tick: usize,
     pub population_budget_per_tick: usize,
     /// Plancher du flux migratoire entrant, en résidents par tick.
@@ -110,6 +115,7 @@ impl Default for SimConfig {
             max_slope_cm: 400,
             road_access_radius_tiles: 2,
             road_snap_radius_m: Fixed::from_int(1),
+            road_construction: true,
             land_value_budget_per_tick: 4096,
             population_budget_per_tick: 4096,
             max_inflow_per_tick: 6,
@@ -162,6 +168,15 @@ pub enum SimEvent {
     CommandRejected {
         error: CommandError,
     },
+    /// Un rond-point a été posé (ses 8 segments d'anneau).
+    RoundaboutBuilt {
+        center: Point,
+        segments: u32,
+    },
+    /// Des chantiers de route se sont achevés : les routes sont ouvertes.
+    RoadsOpened {
+        count: u32,
+    },
 }
 
 /// Ce qu'un tick a produit. `tick` est le tick **exécuté** (pas le suivant).
@@ -197,10 +212,16 @@ pub struct World {
     rng: Pcg32,
 
     terrain: Terrain,
+    /// Générateur du relief, si la carte en vient : il prolonge le terrain
+    /// au-delà de la zone jouable (décor jusqu'à l'horizon). `None` pour un
+    /// terrain fourni à la main (tests, scénarios plats).
+    worldgen: Option<WorldGen>,
     zoning: Zoning,
     roads: RoadNetwork,
     road_access: Vec<bool>,
     road_access_dirty: bool,
+    /// Prochaine fin de chantier routier (évite un balayage par tick).
+    next_road_opening: Option<Tick>,
 
     buildings: Buildings,
     land_value: LandValueLayer,
@@ -270,10 +291,12 @@ impl World {
             calendar,
             rng: Pcg32::new(seed, 0),
             terrain,
+            worldgen: None,
             zoning,
             roads: RoadNetwork::new(),
             road_access,
             road_access_dirty: false,
+            next_road_opening: None,
             buildings,
             land_value,
             census,
@@ -289,6 +312,32 @@ impl World {
     }
 
     // ----------------------------------------------------------------- accès
+
+    /// Monde dont le relief est généré : la zone jouable `width × height`
+    /// tuiles est un échantillonnage de `WorldGen`, qui reste disponible pour
+    /// prolonger le paysage au-delà (`World::worldgen`).
+    #[must_use]
+    pub fn generated(config: SimConfig, seed: u64, params: WorldGenParams, width: u32, height: u32) -> Self {
+        let tile = config.tile_size_m;
+        let generator = WorldGen::new(params, i64::from(width) * i64::from(tile), i64::from(height) * i64::from(tile));
+        let terrain = generator
+            .terrain(width.max(1), height.max(1), tile)
+            .unwrap_or_else(|_| Terrain::flat(width.max(1), height.max(1)));
+        let mut world = Self::new(config, seed, terrain);
+        world.worldgen = Some(generator);
+        world
+    }
+
+    #[must_use]
+    pub const fn worldgen(&self) -> Option<&WorldGen> {
+        self.worldgen.as_ref()
+    }
+
+    /// Active ou coupe les chantiers routiers pour les routes tracées ensuite
+    /// (scénarios : réseau initial livré ouvert, puis chantiers en jeu).
+    pub fn set_road_construction(&mut self, enabled: bool) {
+        self.config.road_construction = enabled;
+    }
 
     #[must_use]
     pub const fn current_tick(&self) -> Tick {
@@ -370,6 +419,7 @@ impl World {
         self.events.clear();
 
         self.apply_commands();
+        self.open_finished_roads();
         self.refresh_road_access();
 
         let land_value_budget = self.config.land_value_budget_per_tick;
@@ -458,8 +508,57 @@ impl World {
                     to_handle,
                     spec,
                 } => self.build_road(from, to, from_handle, to_handle, spec),
+                Command::BuildRoundabout { center, radius_m, spec } => {
+                    self.build_roundabout(center, radius_m, spec);
+                }
             }
         }
+    }
+
+    fn build_roundabout(&mut self, center: Point, radius_m: Fixed, spec: RoadSpec) {
+        let reach = Point::new(radius_m, radius_m);
+        let corners = [
+            Point::new(center.x - reach.x, center.y - reach.y),
+            Point::new(center.x + reach.x, center.y + reach.y),
+        ];
+        if !corners.iter().all(|p| self.point_in_bounds(*p)) {
+            self.events.push(SimEvent::CommandRejected { error: CommandError::OutOfBounds });
+            return;
+        }
+        match self.roads.add_roundabout(center, radius_m, spec) {
+            Ok(segments) => {
+                for segment in &segments {
+                    self.schedule_road_works(*segment);
+                }
+                self.roads.ensure_topology();
+                self.road_access_dirty = true;
+                self.events.push(SimEvent::RoundaboutBuilt { center, segments: segments.len() as u32 });
+            }
+            Err(error) => self.events.push(SimEvent::CommandRejected { error: CommandError::Road(error) }),
+        }
+    }
+
+    /// Met un segment neuf en chantier (si la configuration le demande).
+    fn schedule_road_works(&mut self, segment: SegmentId) {
+        if !self.config.road_construction {
+            return;
+        }
+        let Some(seg) = self.roads.segment(segment) else { return };
+        let opens_at = Tick::new(self.tick.raw() + seg.spec.construction_ticks(seg.length_m));
+        self.roads.set_opens_at(segment, opens_at);
+        self.next_road_opening = Some(self.next_road_opening.map_or(opens_at, |t| t.min(opens_at)));
+    }
+
+    /// Fin de chantier : la desserte est recalculée quand une route ouvre.
+    fn open_finished_roads(&mut self) {
+        let Some(at) = self.next_road_opening else { return };
+        if self.tick < at {
+            return;
+        }
+        let count = self.roads.segments().filter(|(_, s)| s.opens_at == at).count() as u32;
+        self.road_access_dirty = true;
+        self.next_road_opening = self.roads.next_opening(self.tick);
+        self.events.push(SimEvent::RoadsOpened { count });
     }
 
     fn build_road(
@@ -491,6 +590,7 @@ impl World {
         }
         match self.roads.connect(a, b, spec) {
             Ok(segment) => {
+                self.schedule_road_works(segment);
                 self.roads.ensure_topology();
                 self.road_access_dirty = true;
                 let length_m = self
@@ -538,6 +638,7 @@ impl World {
             height,
             self.config.road_access_radius_tiles,
             self.config.tile_size_m,
+            self.tick,
         );
         self.road_access_dirty = false;
         self.growth_candidates_dirty = true;

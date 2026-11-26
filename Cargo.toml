@@ -16,6 +16,7 @@
 resolver = "3"
 members = [
     "crates/app",
+    "crates/i18n",
     "crates/render",
     "crates/sim-core",
     "crates/sim-economy",
@@ -32,6 +33,7 @@ authors = ["CityMayor contributors"]
 
 [workspace.dependencies]
 sim-core = { path = "crates/sim-core" }
+city-i18n = { path = "crates/i18n" }
 # `sim-transport` et `sim-economy` rejoindront cette table (avec `sim-core`
 # en dépendance) au moment de leur implémentation : les déclarer maintenant
 # produirait une dépendance non consommée, donc un warning de build.

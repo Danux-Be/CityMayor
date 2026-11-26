@@ -22,6 +22,9 @@ pub enum ZoneType {
 }
 
 impl ZoneType {
+    /// Toutes les zones, non zoné compris.
+    pub const ALL: [Self; 4] = [Self::Unzoned, Self::Residential, Self::Commercial, Self::Industrial];
+
     /// Zones constructibles, dans l'ordre d'évaluation du système de croissance.
     pub const DEVELOPABLE: [Self; 3] = [Self::Residential, Self::Commercial, Self::Industrial];
 
@@ -36,13 +39,14 @@ impl ZoneType {
         }
     }
 
+    /// Clé du nom affiché dans les fichiers de langue.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub const fn message_key(self) -> &'static str {
         match self {
-            Self::Unzoned => "non zoné",
-            Self::Residential => "résidentiel",
-            Self::Commercial => "commercial",
-            Self::Industrial => "industriel",
+            Self::Unzoned => "zone-unzoned",
+            Self::Residential => "zone-residential",
+            Self::Commercial => "zone-commercial",
+            Self::Industrial => "zone-industrial",
         }
     }
 }

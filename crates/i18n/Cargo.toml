@@ -1,0 +1,16 @@
+[package]
+name = "city-i18n"
+description = "Localisation: Fluent language files (locales/<lang>/*.ftl), English embedded as the fallback."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+fluent-bundle = "0.16.0"
+fluent-syntax = "0.12"
+unic-langid = "0.9.6"
+
+[lints]
+workspace = true
