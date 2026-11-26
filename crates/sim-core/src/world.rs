@@ -70,6 +70,10 @@ pub struct SimConfig {
     pub migration_fill_rate: Fixed,
     /// Départs par tick au maximum, quand la ville attire à l'envers.
     pub max_outflow_per_tick: u32,
+    /// Taux de départ minimal (fraction de `max_outflow_per_tick`) tant que la
+    /// trésorerie est négative, même si le bonheur reste au-dessus de
+    /// `vacate_happiness`. Sans lui, la faillite n'avait aucun effet.
+    pub bankruptcy_outflow_rate: Fixed,
     /// Seuil de demande au-delà duquel la ville construit.
     pub growth_threshold: Fixed,
     /// Taux de croissance **composé** : part du stock existant (par zone) qui
@@ -111,6 +115,7 @@ impl Default for SimConfig {
             max_inflow_per_tick: 6,
             migration_fill_rate: Fixed::from_permille(50),
             max_outflow_per_tick: 4,
+            bankruptcy_outflow_rate: Fixed::from_permille(500),
             growth_threshold: Fixed::from_permille(550),
             growth_rate_of_stock: Fixed::from_permille(10),
             growth_min_per_tick_per_zone: 1,
@@ -205,7 +210,18 @@ pub struct World {
     treasury: Treasury,
 
     commands: VecDeque<Command>,
-    growth_cursor: [u32; 3],
+    /// Tuiles candidates à la construction, par zone développable, dans l'ordre
+    /// des indices : zonées, libres, desservies et constructibles au moment de
+    /// la reconstruction. `grow` les consomme via `growth_cursor` et revalide
+    /// chaque entrée (une entrée périmée est sautée une seule fois).
+    ///
+    /// Pourquoi : l'ancien curseur balayait la grille jusqu'à `tile_count`
+    /// tuiles par zone et par tick dès qu'une zone était saturée, soit un coût
+    /// de tick proportionnel à la carte. La reconstruction reste O(carte), mais
+    /// seulement quand le zonage, une démolition ou la desserte changent.
+    growth_candidates: [Vec<u32>; 3],
+    growth_candidates_dirty: bool,
+    growth_cursor: [usize; 3],
     population_cursor: usize,
     events: Vec<SimEvent>,
 }
@@ -264,6 +280,8 @@ impl World {
             demand,
             treasury,
             commands: VecDeque::new(),
+            growth_candidates: [Vec::new(), Vec::new(), Vec::new()],
+            growth_candidates_dirty: false,
             growth_cursor: [0; 3],
             population_cursor: 0,
             events: Vec::new(),
@@ -410,6 +428,9 @@ impl World {
                             changed += 1;
                         }
                     }
+                    if changed > 0 {
+                        self.growth_candidates_dirty = true;
+                    }
                     self.events
                         .push(SimEvent::ZoneRectApplied { rect, zone, changed });
                 }
@@ -423,6 +444,7 @@ impl World {
                         }
                         self.zoning.set(tile, ZoneType::Unzoned);
                     }
+                    self.growth_candidates_dirty = true;
                     self.events
                         .push(SimEvent::BuildingsBulldozed { rect, removed });
                 }
@@ -518,6 +540,7 @@ impl World {
             self.config.tile_size_m,
         );
         self.road_access_dirty = false;
+        self.growth_candidates_dirty = true;
     }
 
     /// Flux migratoires, borné par `population_budget_per_tick`.
@@ -535,22 +558,31 @@ impl World {
             return;
         }
         let unhappiness = (self.config.vacate_happiness - self.census.happiness).clamp01();
-        let vacating = unhappiness > Fixed::ZERO || self.treasury.is_bankrupt();
+        let bankrupt = self.treasury.is_bankrupt();
+        let vacating = unhappiness > Fixed::ZERO || bankrupt;
 
         // Invariant anti "death wave" : le flux sortant maximal
         // (`unhappiness × max_outflow`) reste sous le flux entrant minimal
         // (`demand_floor × max_inflow`) avec les valeurs par défaut.
-        let rate = if vacating {
+        // En faillite, un départ minimal s'applique même si le bonheur est bon.
+        let rate = if bankrupt {
+            unhappiness.max(self.config.bankruptcy_outflow_rate)
+        } else if vacating {
             unhappiness
         } else {
             self.demand.residential
         };
         // Flux piloté par la vacance : `fill_rate × logements vides`, borné
         // inférieurement par le plancher configuré (amorçage d'un hameau).
-        let vacant_people = self
-            .census
-            .housing_capacity
-            .saturating_sub(self.census.population);
+        // Agrégats courants (O(1)) : ils tiennent compte d'une démolition faite
+        // par une commande de ce tick, contrairement au census précédent.
+        let totals = self.buildings.totals();
+        let vacant_people = totals.housing_capacity.saturating_sub(totals.population);
+        // Rien à faire : ne pas balayer tous les logements pour rien (c'était le
+        // cas de toute ville pleine, à chaque tick).
+        if (vacating && totals.population == 0) || (!vacating && vacant_people == 0) {
+            return;
+        }
         let fill = self
             .config
             .migration_fill_rate
@@ -572,9 +604,12 @@ impl World {
             return;
         }
 
+        // Inspection bornée par le budget : le curseur persiste, les logements
+        // non vus seront visités aux ticks suivants.
+        let inspect_limit = household_count.min(self.config.population_budget_per_tick);
         let mut cursor = self.population_cursor % household_count;
         let mut inspected = 0usize;
-        while remaining > 0 && inspected < household_count {
+        while remaining > 0 && inspected < inspect_limit {
             let Some(id) = self.buildings.household_at(cursor) else {
                 break;
             };
@@ -597,9 +632,7 @@ impl World {
                 (occupied + 1).min(capacity)
             };
 
-            if let Some(slot) = self.buildings.get_mut(id) {
-                slot.occupants = new_occupants;
-            }
+            let _ = self.buildings.set_occupants(id, new_occupants);
             remaining -= 1;
             if new_occupants == 0 {
                 self.events.push(SimEvent::HouseholdEmptied { id });
@@ -610,10 +643,31 @@ impl World {
 
     /// Croissance : construit sur les tuiles zonées, desservies, constructibles
     /// et inoccupées. `quota` proportionnel à la demande, plafonné par zone.
+    /// Reconstruit les listes de candidats. O(carte), appelé seulement quand
+    /// `growth_candidates_dirty` (zonage, démolition, desserte).
+    fn rebuild_growth_candidates(&mut self) {
+        for list in &mut self.growth_candidates {
+            list.clear();
+        }
+        for (index, &zone) in self.zoning.grid().as_slice().iter().enumerate() {
+            let Some(zone_index) = zone.developable_index() else {
+                continue;
+            };
+            let tile = TileId::new(index as u32);
+            if self.buildings.at(tile).is_none()
+                && self.road_access.get(index).copied().unwrap_or(false)
+                && self.terrain.is_buildable(tile, self.config.max_slope_cm)
+            {
+                self.growth_candidates[zone_index].push(index as u32);
+            }
+        }
+        self.growth_cursor = [0; 3];
+        self.growth_candidates_dirty = false;
+    }
+
     fn grow(&mut self) {
-        let tile_count = self.zoning.grid().len();
-        if tile_count == 0 {
-            return;
+        if self.growth_candidates_dirty {
+            self.rebuild_growth_candidates();
         }
         let threshold = self.config.growth_threshold;
         let span = Fixed::ONE - threshold;
@@ -639,13 +693,17 @@ impl World {
                 continue;
             }
 
+            // Coût : O(quota + entrées périmées), chaque entrée n'étant lue
+            // qu'une fois par reconstruction. Liste épuisée = arrêt immédiat.
             let mut spawned = 0u32;
-            let mut scanned = 0usize;
-            while spawned < quota && scanned < tile_count {
-                let cursor = (self.growth_cursor[zone_index] as usize) % tile_count;
-                self.growth_cursor[zone_index] = ((cursor + 1) % tile_count) as u32;
-                scanned += 1;
-                let tile = TileId::new(cursor as u32);
+            while spawned < quota {
+                let position = self.growth_cursor[zone_index];
+                let Some(&raw) = self.growth_candidates[zone_index].get(position) else {
+                    break;
+                };
+                self.growth_cursor[zone_index] = position + 1;
+                let tile = TileId::new(raw);
+                let cursor = raw as usize;
 
                 if self.zoning.get(tile) != Some(zone) {
                     continue;
@@ -817,6 +875,70 @@ mod tests {
             assert!(quota >= previous, "stock {stock}: {quota} < {previous}");
             previous = quota;
         }
+    }
+
+    /// Petite ville mixte, desservie, peuplée.
+    fn populated_world() -> World {
+        let mut world = World::new(config(), 1, Terrain::flat(24, 24));
+        let m = |t: i32| Fixed::from_int(t * crate::TILE_SIZE_M + crate::TILE_SIZE_M / 2);
+        world.queue(Command::BuildRoad {
+            from: Point::new(m(1), m(10)),
+            to: Point::new(m(22), m(10)),
+            spec: crate::road::RoadSpec::TWO_WAY,
+        });
+        for (rows, zone) in [
+            ((11, 12), ZoneType::Residential),
+            ((9, 9), ZoneType::Commercial),
+            ((8, 8), ZoneType::Industrial),
+        ] {
+            world.queue(Command::ZoneRect {
+                rect: Rect::new(2, rows.0, 21, rows.1),
+                zone,
+            });
+        }
+        for _ in 0..1_500 {
+            world.tick();
+        }
+        assert!(world.census().population > 0);
+        world
+    }
+
+    #[test]
+    fn bankruptcy_drives_residents_out_even_when_happy() {
+        let mut world = populated_world();
+        assert!(world.census().happiness > world.config().vacate_happiness);
+        let before = world.census().population;
+
+        world.treasury.funds_cents = -1;
+        for _ in 0..20 {
+            world.tick();
+        }
+        assert!(
+            world.census().population < before,
+            "faillite sans effet : {before} -> {}",
+            world.census().population
+        );
+    }
+
+    #[test]
+    fn saturated_zones_exhaust_their_candidate_lists() {
+        let mut world = populated_world();
+        // Le résidentiel est saturé (la demande R reste haute) : le curseur est
+        // en bout de liste et `grow` s'arrête en O(1) au lieu de balayer la carte.
+        let residential = ZoneType::Residential.developable_index().unwrap();
+        assert!(world.demand.residential > world.config.growth_threshold);
+        assert_eq!(
+            world.growth_cursor[residential],
+            world.growth_candidates[residential].len()
+        );
+        assert!(!world.growth_candidates_dirty);
+        for _ in 0..50 {
+            world.tick();
+        }
+        assert_eq!(
+            world.growth_cursor[residential],
+            world.growth_candidates[residential].len()
+        );
     }
 
     #[test]

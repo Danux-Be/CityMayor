@@ -83,11 +83,62 @@ impl Building {
     }
 }
 
+/// Agrégats maintenus incrémentalement par `Buildings` (O(1) à lire).
+///
+/// C'est l'entrée du census : sans eux, `Census::recompute` parcourait tout le
+/// slab à chaque tick, soit un coût proportionnel à la carte. Toute mutation
+/// passe par `spawn`, `remove` ou `set_occupants`, qui tiennent ces sommes à
+/// jour ; il n'existe plus d'accès `&mut Building` public.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BuildingTotals {
+    /// Capacité résidentielle totale.
+    pub housing_capacity: u32,
+    /// Résidents effectifs (somme des `occupants` des logements).
+    pub population: u32,
+    /// Logements ayant au moins un occupant.
+    pub occupied_households: u32,
+    /// Emplois commerciaux (capacité des commerces).
+    pub commercial_jobs: u32,
+    /// Emplois industriels (capacité des usines).
+    pub industrial_jobs: u32,
+}
+
+impl BuildingTotals {
+    fn add(&mut self, building: &Building) {
+        match building.kind {
+            BuildingKind::Household => {
+                self.housing_capacity += building.capacity;
+                self.population += building.occupants;
+                if building.occupants > 0 {
+                    self.occupied_households += 1;
+                }
+            }
+            BuildingKind::Shop => self.commercial_jobs += building.capacity,
+            BuildingKind::Factory => self.industrial_jobs += building.capacity,
+        }
+    }
+
+    fn sub(&mut self, building: &Building) {
+        match building.kind {
+            BuildingKind::Household => {
+                self.housing_capacity -= building.capacity;
+                self.population -= building.occupants;
+                if building.occupants > 0 {
+                    self.occupied_households -= 1;
+                }
+            }
+            BuildingKind::Shop => self.commercial_jobs -= building.capacity,
+            BuildingKind::Factory => self.industrial_jobs -= building.capacity,
+        }
+    }
+}
+
 /// Slab de bâtiments indexé par tuile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Buildings {
     slots: Vec<Option<Building>>,
     live: u32,
+    totals: BuildingTotals,
     /// Stock par type, maintenu incrémentalement : c'est l'entrée de la loi de
     /// croissance composée (`World::grow`) et un agrégat gratuit pour le HUD.
     by_kind: [u32; 3],
@@ -112,6 +163,7 @@ impl Buildings {
         Self {
             slots: vec![None; tile_count],
             live: 0,
+            totals: BuildingTotals::default(),
             by_kind: [0; 3],
             households: Vec::new(),
             household_pos: vec![u32::MAX; tile_count],
@@ -141,9 +193,22 @@ impl Buildings {
         self.slots.get(id.index()).and_then(Option::as_ref)
     }
 
+    /// Fixe le nombre d'occupants d'un bâtiment (borné à sa capacité) et met
+    /// les agrégats à jour. Renvoie l'ancienne valeur, `None` si l'id est mort.
+    pub fn set_occupants(&mut self, id: BuildingId, occupants: u32) -> Option<u32> {
+        let building = self.slots.get_mut(id.index()).and_then(Option::as_mut)?;
+        let previous = *building;
+        building.occupants = occupants.min(building.capacity);
+        let updated = *building;
+        self.totals.sub(&previous);
+        self.totals.add(&updated);
+        Some(previous.occupants)
+    }
+
+    /// Agrégats courants (O(1)).
     #[must_use]
-    pub fn get_mut(&mut self, id: BuildingId) -> Option<&mut Building> {
-        self.slots.get_mut(id.index()).and_then(Option::as_mut)
+    pub const fn totals(&self) -> BuildingTotals {
+        self.totals
     }
 
     #[must_use]
@@ -158,13 +223,15 @@ impl Buildings {
         if slot.is_some() {
             return None;
         }
-        *slot = Some(Building {
+        let building = Building {
             kind,
             tile,
             level: 1,
             capacity,
             occupants: 0,
-        });
+        };
+        *slot = Some(building);
+        self.totals.add(&building);
         self.live += 1;
         self.by_kind[kind.index()] += 1;
         let id = BuildingId::new(tile.raw());
@@ -179,6 +246,7 @@ impl Buildings {
         let slot = self.slots.get_mut(id.index())?;
         let removed = slot.take();
         if let Some(building) = removed {
+            self.totals.sub(&building);
             self.live -= 1;
             self.by_kind[building.kind.index()] -= 1;
             if building.kind == BuildingKind::Household {
@@ -222,26 +290,24 @@ impl Buildings {
             .filter_map(|(i, b)| b.as_ref().map(|b| (BuildingId::new(i as u32), b)))
     }
 
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (BuildingId, &mut Building)> + '_ {
-        self.slots
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(i, b)| b.as_mut().map(|b| (BuildingId::new(i as u32), b)))
+    /// Somme des capacités par catégorie : `(logements, emplois)`, O(1).
+    #[must_use]
+    pub const fn capacity_totals(&self) -> (u32, u32) {
+        (
+            self.totals.housing_capacity,
+            self.totals.commercial_jobs + self.totals.industrial_jobs,
+        )
     }
 
-    /// Somme des capacités par catégorie (un seul passage, hot path du census).
+    /// Recalcule les agrégats par un passage complet. Réservé aux tests et aux
+    /// assertions de cohérence : le hot path lit `totals()`.
     #[must_use]
-    pub fn capacity_totals(&self) -> (u32, u32) {
-        let mut households = 0u32;
-        let mut job_slots = 0u32;
+    pub fn recount_totals(&self) -> BuildingTotals {
+        let mut totals = BuildingTotals::default();
         for b in self.slots.iter().flatten() {
-            if b.is_household() {
-                households += b.capacity;
-            } else {
-                job_slots += b.capacity;
-            }
+            totals.add(b);
         }
-        (households, job_slots)
+        totals
     }
 }
 
@@ -314,5 +380,39 @@ mod tests {
         b.spawn(TileId::new(2), BuildingKind::Shop, 3).unwrap();
         b.spawn(TileId::new(3), BuildingKind::Factory, 9).unwrap();
         assert_eq!(b.capacity_totals(), (10, 12));
+    }
+
+    #[test]
+    fn incremental_totals_match_a_full_recount() {
+        let mut b = Buildings::new(64);
+        let mut rng = crate::rng::Pcg32::new(7, 1);
+        for step in 0..2_000u32 {
+            let tile = TileId::new(rng.next_u32() % 64);
+            match rng.next_u32() % 4 {
+                0 => {
+                    let kind = [BuildingKind::Household, BuildingKind::Shop, BuildingKind::Factory]
+                        [(rng.next_u32() % 3) as usize];
+                    let _ = b.spawn(tile, kind, 1 + rng.next_u32() % 40);
+                }
+                1 => {
+                    let _ = b.remove(BuildingId::new(tile.raw()));
+                }
+                _ => {
+                    let _ = b.set_occupants(BuildingId::new(tile.raw()), rng.next_u32() % 50);
+                }
+            }
+            assert_eq!(b.totals(), b.recount_totals(), "divergence au pas {step}");
+        }
+    }
+
+    #[test]
+    fn set_occupants_is_clamped_to_capacity() {
+        let mut b = Buildings::new(4);
+        let id = b.spawn(TileId::new(2), BuildingKind::Household, 5).unwrap();
+        assert_eq!(b.set_occupants(id, 99), Some(0));
+        assert_eq!(b.get(id).unwrap().occupants, 5);
+        assert_eq!(b.totals().population, 5);
+        assert_eq!(b.totals().occupied_households, 1);
+        assert_eq!(b.set_occupants(BuildingId::new(0), 1), None);
     }
 }

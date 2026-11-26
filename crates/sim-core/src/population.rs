@@ -17,7 +17,7 @@
 //! - Le bonheur est un **EMA** (lissage), pas un calcul instantané : pas de
 //!   bascule binaire toutes les secondes.
 
-use crate::building::{BuildingKind, Buildings};
+use crate::building::{BuildingTotals, Buildings};
 use crate::fixed::Fixed;
 
 /// Agrégats de la ville pour un tick donné.
@@ -63,7 +63,8 @@ impl Default for Census {
 }
 
 impl Census {
-    /// Recalcule les agrégats. `O(bâtiments)`, un seul passage, zéro allocation.
+    /// Recalcule les agrégats. O(1) : lit les sommes que `Buildings` maintient
+    /// incrémentalement (le coût du tick ne dépend plus du nombre de bâtiments).
     #[must_use]
     pub fn recompute(
         buildings: &Buildings,
@@ -71,27 +72,13 @@ impl Census {
         previous_happiness: Fixed,
         happiness_smoothing: Fixed,
     ) -> Self {
-        let mut population = 0u32;
-        let mut households = 0u32;
-        let mut housing_capacity = 0u32;
-        let mut commercial_jobs = 0u32;
-        let mut industrial_jobs = 0u32;
-
-        for (_, b) in buildings.iter() {
-            match b.kind {
-                BuildingKind::Household => {
-                    housing_capacity = housing_capacity.saturating_add(b.capacity);
-                    population = population.saturating_add(b.occupants);
-                    if b.occupants > 0 {
-                        households += 1;
-                    }
-                }
-                BuildingKind::Shop => commercial_jobs = commercial_jobs.saturating_add(b.capacity),
-                BuildingKind::Factory => {
-                    industrial_jobs = industrial_jobs.saturating_add(b.capacity);
-                }
-            }
-        }
+        let BuildingTotals {
+            housing_capacity,
+            population,
+            occupied_households: households,
+            commercial_jobs,
+            industrial_jobs,
+        } = buildings.totals();
 
         let jobs = commercial_jobs.saturating_add(industrial_jobs);
         // Point fixe : population × participation, sans détour par f32.
@@ -171,6 +158,7 @@ impl Census {
 
 #[cfg(test)]
 mod tests {
+    use crate::building::BuildingKind;
     use crate::ids::TileId;
 
     use super::*;
@@ -202,7 +190,7 @@ mod tests {
     fn employment_and_vacancy_are_derived() {
         let mut b = city();
         let household = b.at(TileId::new(0)).unwrap();
-        b.get_mut(household).unwrap().occupants = 7;
+        b.set_occupants(household, 7).unwrap();
         let census = Census::recompute(
             &b,
             Fixed::from_permille(500),
@@ -224,7 +212,7 @@ mod tests {
         let mut b = Buildings::new(4);
         b.spawn(TileId::new(0), BuildingKind::Household, 100).unwrap();
         let household = b.at(TileId::new(0)).unwrap();
-        b.get_mut(household).unwrap().occupants = 40;
+        b.set_occupants(household, 40).unwrap();
         let census = Census::recompute(
             &b,
             Fixed::from_permille(500),

@@ -63,7 +63,7 @@ pub mod time;
 pub mod world;
 pub mod zoning;
 
-pub use building::{Building, BuildingKind, Buildings};
+pub use building::{Building, BuildingKind, BuildingTotals, Buildings};
 pub use command::{Command, CommandError, Rect};
 pub use demand::{Demand, DemandParams};
 pub use economy::{BudgetParams, BudgetReport, Treasury};

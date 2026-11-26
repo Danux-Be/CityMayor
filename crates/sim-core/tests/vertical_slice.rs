@@ -534,3 +534,43 @@ fn curved_road_command_serves_the_bulge() {
     assert!(access[my * 32 + mx], "tuile au sommet desservie");
     assert!(!access[10 * 32 + mx], "la corde ne dessert pas ce rang");
 }
+
+#[test]
+fn bulldozed_tiles_become_buildable_again_after_rezoning() {
+    let mut world = demo_world();
+    run(&mut world, 400);
+    let before = world.buildings().live_count();
+    assert!(before > 0);
+
+    world.queue(Command::BulldozeRect {
+        rect: Rect::new(4, 9, 24, 11),
+    });
+    world.tick();
+    world.queue(Command::ZoneRect {
+        rect: Rect::new(4, 9, 24, 11),
+        zone: ZoneType::Residential,
+    });
+    world.tick();
+    let after_bulldoze = world.buildings().live_count();
+    run(&mut world, 600);
+
+    // La liste des candidats a été reconstruite : les tuiles libérées
+    // reconstruisent au lieu de rester vides.
+    assert!(world.buildings().live_count() > after_bulldoze);
+}
+
+#[test]
+fn saturated_city_keeps_aggregates_consistent() {
+    let mut world = demo_world();
+    run(&mut world, 3_000);
+    let s = world.snapshot();
+    // La ville sature son zonage : plus aucun candidat, plus aucune place.
+    assert_eq!(s.population, s.housing_capacity);
+    let totals = world.buildings().totals();
+    assert_eq!(totals, world.buildings().recount_totals());
+    assert_eq!(world.census().population, totals.population);
+    // Une ville pleine reste stable (pas de construction fantôme).
+    let built = world.buildings().live_count();
+    run(&mut world, 200);
+    assert_eq!(world.buildings().live_count(), built);
+}

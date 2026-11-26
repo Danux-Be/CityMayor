@@ -4,10 +4,10 @@ City-builder 3D en Rust, inspiré de *Cities: Skylines* / *SimCity*.
 Cible : **1 M d'habitants**, routes **courbes**, rendu **Bevy**.
 
 État : itération 1 terminée + itération 2a (viewer Bevy fonctionnel).
-**95 tests**, clippy muet, démo headless et viewer 3D opérationnels.
+**102 tests**, clippy muet, démo headless et viewer 3D opérationnels.
 
 ```bash
-cargo test --workspace                # 95 tests, ~0,5 s (sans Bevy)
+cargo test --workspace                # 102 tests, ~0,5 s (sans Bevy)
 cargo run -p citymayor-app            # ville de démo headless, 640 ticks
 cargo run -p citymayor-app --features viewer --bin city-viewer   # fenêtre 3D
 ```
@@ -95,7 +95,11 @@ apply_commands → refresh_road_access → land_value → move_population
 ```
 
 Le coût d'un tick ne dépend pas de la taille de la carte : budgets de tuiles et
-de bâtiments par tick, curseurs persistants. Les budgets foncier/population sont
+de bâtiments par tick, curseurs persistants, census O(1) (agrégats tenus par
+`Buildings`), listes de tuiles candidates par zone pour la croissance
+(reconstruites seulement quand le zonage, une démolition ou la desserte
+changent). En faillite, un départ minimal s'applique
+(`bankruptcy_outflow_rate`). Les budgets foncier/population sont
 dérivés de la surface (`tuiles/400`, bornés 4 096..65 536).
 
 ## Modèle de simulation (MVP)

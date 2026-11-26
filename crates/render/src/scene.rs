@@ -18,7 +18,61 @@
 //! - Le rendu est en **mètres, Y vers le haut**. La simulation est en 2D
 //!   (`Point { x, y }` = plan du sol) : la conversion se fait ici, une fois.
 
-use sim_core::{BuildingKind, World};
+use sim_core::{
+    tile_center_m, BuildingKind, Command, Fixed, Point, Rect, RoadSpec, SimConfig, Terrain,
+    World, ZoneType,
+};
+
+/// Construit un monde de démonstration : un maillage d'avenues, un boulevard
+/// courbe pour montrer les splines, et un zonage mixte qui produit une ville
+/// lisible en quelques secondes. Vit ici (sans Bevy) pour être testé.
+#[must_use]
+pub fn demo_city() -> World {
+    let mut world = World::new(SimConfig::default(), 0x0C17_CAFE, Terrain::flat(128, 128));
+    for row in 0..10i32 {
+        let y = 16 + row * 10;
+        world.queue(Command::BuildRoad {
+            from: Point::new(tile_center_m(8), tile_center_m(y)),
+            to: Point::new(tile_center_m(120), tile_center_m(y)),
+            spec: RoadSpec::AVENUE,
+        });
+        for (band, zone) in [
+            (y + 1, ZoneType::Residential),
+            (y + 2, ZoneType::Residential),
+            (y + 3, ZoneType::Residential),
+            (y - 1, ZoneType::Commercial),
+            (y - 2, ZoneType::Industrial),
+            (y - 3, ZoneType::Industrial),
+        ] {
+            world.queue(Command::ZoneRect {
+                rect: Rect::new(8, band as u32, 120, band as u32),
+                zone,
+            });
+        }
+    }
+    // Boulevard courbe entre l'extrémité ouest de la première et de la dernière
+    // avenue. Ces deux nœuds existent déjà (poignée nulle) et une poignée n'est
+    // appliquée qu'à un nœud *créé* par la commande (invariant 11) : un seul
+    // segment entre eux serait donc une droite. On passe par un nœud
+    // intermédiaire neuf, porteur de la tangente : les deux demi-segments sont
+    // courbes et partagent cette tangente (G1 au milieu).
+    let middle = Point::new(tile_center_m(44), tile_center_m(61));
+    world.queue(Command::BuildCurve {
+        from: Point::new(tile_center_m(8), tile_center_m(16)),
+        to: middle,
+        from_handle: Point::default(),
+        to_handle: Point::new(Fixed::ZERO, Fixed::from_int(160)),
+        spec: RoadSpec::TWO_WAY,
+    });
+    world.queue(Command::BuildCurve {
+        from: middle,
+        to: Point::new(tile_center_m(8), tile_center_m(106)),
+        from_handle: Point::default(),
+        to_handle: Point::default(),
+        spec: RoadSpec::TWO_WAY,
+    });
+    world
+}
 
 /// Bloc de bâtiment prêt à être instancié (boîte alignée sur les axes).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -230,11 +284,24 @@ pub fn block_is_sane(block: &BuildingBlock) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use sim_core::{
-        tile_center_m, Command, Fixed, Point, Rect, RoadSpec, SimConfig, Terrain, ZoneType, World,
-    };
-
     use super::*;
+
+    #[test]
+    fn demo_boulevard_is_actually_curved() {
+        let mut world = demo_city();
+        world.tick();
+        let roads = world.roads();
+        // 10 avenues droites + 2 demi-boulevards courbes.
+        assert_eq!(roads.live_segments(), 12);
+        let curved: Vec<_> = roads
+            .segments()
+            .filter(|(_, seg)| !seg.curve.is_straight())
+            .collect();
+        assert_eq!(curved.len(), 2, "le boulevard doit être courbe");
+        for (_, seg) in &curved {
+            assert!(seg.length_m > seg.curve.p0.distance(seg.curve.p1));
+        }
+    }
 
     fn demo() -> World {
         let mut world = World::new(SimConfig::default(), 21, Terrain::flat(32, 32));
