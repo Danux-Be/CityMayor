@@ -5,7 +5,7 @@
 //! choisie. C'est le seul pont entre `sim-core` et `city-i18n`.
 
 use city_i18n::{Arg, Localizer};
-use sim_core::{BuildingKind, CommandError, Overlay, RoadSpec, SimEvent, ZoneType};
+use sim_core::{BuildingKind, CommandError, ConstructionStage, Fixed, Overlay, RoadSpec, SimEvent, ZoneType};
 
 #[must_use]
 pub fn zone(loc: &Localizer, zone: ZoneType) -> String {
@@ -30,6 +30,19 @@ pub fn road_type(loc: &Localizer, spec: RoadSpec) -> String {
 #[must_use]
 pub fn command_error(loc: &Localizer, error: &CommandError) -> String {
     loc.text(error.message_key())
+}
+
+/// Stade d'un chantier et son avancement global, ex. « Structural work (42%) ».
+#[must_use]
+pub fn construction(loc: &Localizer, stage: ConstructionStage, progress: Fixed) -> String {
+    if stage == ConstructionStage::Complete {
+        return loc.text(stage.message_key());
+    }
+    let percent = (progress.to_f32() * 100.0).round() as i32;
+    loc.format(
+        "construction-progress",
+        &[("stage", Arg::from(loc.text(stage.message_key()))), ("percent", Arg::from(percent))],
+    )
 }
 
 /// Somme en dollars (centimes → unités entières).
@@ -58,6 +71,9 @@ pub fn event(loc: &Localizer, event: &SimEvent, month: u32) -> Option<String> {
             &[("kind", Arg::from(building_kind(loc, *kind).to_lowercase())), ("capacity", Arg::from(*capacity))],
         ),
         SimEvent::HouseholdEmptied { .. } => loc.text("event-household-emptied"),
+        SimEvent::BuildingCompleted { kind, .. } => {
+            loc.format("event-building-completed", &[("kind", Arg::from(building_kind(loc, *kind)))])
+        }
         SimEvent::BudgetSettled { report } => loc.format(
             "event-budget-settled",
             &[
@@ -96,6 +112,7 @@ mod tests {
         keys.push(CommandError::OutOfBounds.message_key());
         keys.extend(RoadSpec::CATALOGUE.iter().map(|(key, _)| *key));
         keys.push("road-custom");
+        keys.extend(ConstructionStage::ALL.iter().map(|s| s.message_key()));
         let missing: Vec<_> = keys.into_iter().filter(|k| !en.has(k)).collect();
         assert!(missing.is_empty(), "clés absentes de locales/en : {missing:?}");
     }
@@ -151,7 +168,8 @@ mod tests {
             kind: BuildingKind::Shop,
             capacity: 12,
         };
-        assert_eq!(event(&en, &built, 1).unwrap(), "New shop (12 capacity)");
+        assert_eq!(event(&en, &built, 1).unwrap(), "Construction started: shop (12 capacity)");
+        assert_eq!(construction(&en, ConstructionStage::Structure, Fixed::from_permille(420)), "Structural work (42%)");
         let rejected = SimEvent::CommandRejected { error: CommandError::OutOfBounds };
         assert_eq!(
             event(&en, &rejected, 1).unwrap(),

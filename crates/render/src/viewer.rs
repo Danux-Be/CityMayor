@@ -220,6 +220,9 @@ struct Handles {
 /// seulement quand ses bâtiments changent.
 const CITY_CHUNK_TILES: u32 = 16;
 
+/// Morceaux de ville reconstruits au plus par passage de `refresh_city`.
+const CITY_REBUILD_BUDGET: usize = 6;
+
 /// Morceaux de ville construits : empreinte des bâtiments, entité, maillage.
 #[derive(Resource, Default)]
 struct City {
@@ -266,6 +269,7 @@ impl City {
         let roads_changed = network_changed;
         let grid = world.zoning().grid();
         let (w, h) = (grid.width(), grid.height());
+        let mut rebuilt = 0usize;
         for cy in (0..h).step_by(CITY_CHUNK_TILES as usize) {
             for cx in (0..w).step_by(CITY_CHUNK_TILES as usize) {
                 // Une tuile de marge : la parcelle dépend des voisines.
@@ -280,6 +284,13 @@ impl City {
                 if entry.0 == signature && !roads_changed {
                     continue;
                 }
+                // Budget par passage : les chantiers font évoluer beaucoup de
+                // morceaux à la fois ; le reste attend le passage suivant
+                // (sauf au premier passage et quand la voirie change).
+                if rebuilt >= CITY_REBUILD_BUDGET && entry.1.is_some() && !roads_changed {
+                    continue;
+                }
+                rebuilt += 1;
                 entry.0 = signature;
                 // Marge d'une tuile : les arbres voisins dépendent des parcelles.
                 changed.push([
@@ -436,6 +447,7 @@ fn urban_layers() -> Image {
         "09_industrie", "10_tuiles", "11_ardoises", "12_toit_tole", "13_toit_plat",
         "14_asphalte", "15_marquage", "16_trottoir", "17_beton", "18_pelouse",
         "19_porte", "20_chemin", "21_chantier", "22_fleche", "23_glissiere", "24_balise",
+        "25_palissade",
     );
     texture_array("urban_layers", &SOURCES, &urban::LAYER_NAMES)
 }

@@ -53,6 +53,16 @@ event-bulldozed = { $removed ->
    *[other] { $removed } buildings demolished
 }
 event-road-built = Road built ({ $length } m)
-event-building-built = New { $kind } ({ $capacity } capacity)
+event-building-built = Construction started: { $kind } ({ $capacity } capacity)
+event-building-completed = { $kind } completed
+
+## Construction stages
+
+construction-site-preparation = Site preparation
+construction-foundations = Foundations
+construction-structure = Structural work
+construction-finishing = Finishing works
+construction-complete = Completed
+construction-progress = { $stage } ({ $percent }%)
 event-household-emptied = A home was abandoned
 event-budget-settled = Budget for month { $month }: +${ $income } / -${ $expenses } → ${ $funds }

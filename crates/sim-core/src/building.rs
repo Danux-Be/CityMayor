@@ -8,7 +8,11 @@
 //! - quand les parcelles multi-tuiles arriveront, `Buildings` passera à un slab
 //!   compact + `Vec<Option<BuildingId>>` par tuile (même API, changement interne).
 
+use std::collections::BTreeSet;
+
+use crate::fixed::Fixed;
 use crate::ids::{BuildingId, TileId};
+use crate::time::Tick;
 use crate::zoning::ZoneType;
 
 /// Nature d'un bâtiment, dérivée de la zone mais stockée (les zones peuvent
@@ -52,6 +56,19 @@ impl BuildingKind {
         }
     }
 
+    /// Durée du chantier (ticks) d'un bâtiment neuf de cette capacité :
+    /// une maison prend une demi-journée de jeu, un immeuble ou une usine
+    /// une journée ou plus.
+    #[must_use]
+    pub const fn construction_ticks(self, capacity: u32) -> u64 {
+        let (base, per_unit) = match self {
+            Self::Household => (420, 14),
+            Self::Shop => (520, 22),
+            Self::Factory => (700, 24),
+        };
+        base + per_unit * capacity as u64
+    }
+
     /// Index dense `0..3` pour les compteurs (stock par type).
     #[must_use]
     pub const fn index(self) -> usize {
@@ -63,16 +80,73 @@ impl BuildingKind {
     }
 }
 
+/// Stade d'un chantier de bâtiment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConstructionStage {
+    /// Palissade, terrassement, engins.
+    SitePreparation,
+    /// Dalle, coffrages.
+    Foundations,
+    /// Gros œuvre : la structure monte, échafaudages, grue.
+    Structure,
+    /// Façades et toiture posées, échafaudages encore en place.
+    Finishing,
+    /// Livré : habitants ou emplois.
+    Complete,
+}
+
+impl ConstructionStage {
+    pub const ALL: [Self; 5] = [Self::SitePreparation, Self::Foundations, Self::Structure, Self::Finishing, Self::Complete];
+
+    /// Part du chantier (‰) à laquelle chaque stade commence.
+    const STARTS_PERMILLE: [u16; 4] = [0, 150, 350, 780];
+
+    /// Stade et avancement **dans** ce stade `[0, 1]`, d'après l'avancement
+    /// global du chantier.
+    #[must_use]
+    pub fn from_progress(progress: Fixed) -> (Self, Fixed) {
+        if progress >= Fixed::ONE {
+            return (Self::Complete, Fixed::ONE);
+        }
+        let starts = Self::STARTS_PERMILLE.map(Fixed::from_permille);
+        let mut stage = 0;
+        while stage + 1 < starts.len() && progress >= starts[stage + 1] {
+            stage += 1;
+        }
+        let end = starts.get(stage + 1).copied().unwrap_or(Fixed::ONE);
+        let within = (progress - starts[stage]).div(end - starts[stage]).clamp01();
+        (Self::ALL[stage], within)
+    }
+
+    /// Clé du nom affiché (fichiers de langue).
+    #[must_use]
+    pub const fn message_key(self) -> &'static str {
+        match self {
+            Self::SitePreparation => "construction-site-preparation",
+            Self::Foundations => "construction-foundations",
+            Self::Structure => "construction-structure",
+            Self::Finishing => "construction-finishing",
+            Self::Complete => "construction-complete",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Building {
     pub kind: BuildingKind,
     pub tile: TileId,
     /// Niveau de développement (1..=3 à terme : densité, emplois, revenus).
     pub level: u8,
-    /// Résidents (logement) ou emplois (commerce/industrie).
+    /// Résidents (logement) ou emplois (commerce/industrie) une fois livré.
     pub capacity: u32,
-    /// Occupants effectifs (résidents). Toujours `<= capacity`.
+    /// Occupants effectifs (résidents). Toujours `<= capacity`, et nul tant
+    /// que le chantier n'est pas livré.
     pub occupants: u32,
+    /// Début et fin du chantier. Égaux pour un bâtiment livré d'emblée.
+    pub started_at: Tick,
+    pub ready_at: Tick,
+    /// Livré : ses logements ou emplois comptent.
+    pub complete: bool,
 }
 
 impl Building {
@@ -81,9 +155,39 @@ impl Building {
         matches!(self.kind, BuildingKind::Household)
     }
 
+    /// Places libres. Un chantier n'en a aucune.
     #[must_use]
     pub const fn free_slots(self) -> u32 {
+        if !self.complete {
+            return 0;
+        }
         self.capacity.saturating_sub(self.occupants)
+    }
+
+    /// Avancement du chantier `[0, 1]` à `now`.
+    #[must_use]
+    pub fn construction_progress(&self, now: Tick) -> Fixed {
+        if self.complete || now >= self.ready_at {
+            return Fixed::ONE;
+        }
+        let total = self.ready_at.raw().saturating_sub(self.started_at.raw()).max(1);
+        let done = now.raw().saturating_sub(self.started_at.raw()).min(total);
+        Fixed::from_ratio(done as i32, total as i32).clamp01()
+    }
+
+    /// Stade du chantier à `now`, et avancement dans ce stade.
+    #[must_use]
+    pub fn stage(&self, now: Tick) -> (ConstructionStage, Fixed) {
+        if self.complete {
+            return (ConstructionStage::Complete, Fixed::ONE);
+        }
+        let (stage, within) = ConstructionStage::from_progress(self.construction_progress(now));
+        // Livré seulement par `Buildings::complete_due` : jusque-là, finitions.
+        if stage == ConstructionStage::Complete {
+            (ConstructionStage::Finishing, Fixed::ONE)
+        } else {
+            (stage, within)
+        }
     }
 }
 
@@ -109,6 +213,10 @@ pub struct BuildingTotals {
 
 impl BuildingTotals {
     fn add(&mut self, building: &Building) {
+        // Un chantier n'offre ni logement ni emploi.
+        if !building.complete {
+            return;
+        }
         match building.kind {
             BuildingKind::Household => {
                 self.housing_capacity += building.capacity;
@@ -123,6 +231,9 @@ impl BuildingTotals {
     }
 
     fn sub(&mut self, building: &Building) {
+        if !building.complete {
+            return;
+        }
         match building.kind {
             BuildingKind::Household => {
                 self.housing_capacity -= building.capacity;
@@ -159,6 +270,10 @@ pub struct Buildings {
     /// `swap_remove` + réparation de la position déplacée (O(1)).
     households: Vec<BuildingId>,
     household_pos: Vec<u32>,
+    /// Chantiers en cours, par date de livraison : `(ready_at, slot)`.
+    /// Ensemble ordonné (déterministe) ; une entrée périmée (bâtiment démoli)
+    /// est ignorée quand elle sort.
+    works: BTreeSet<(u64, u32)>,
 }
 
 impl Buildings {
@@ -171,7 +286,14 @@ impl Buildings {
             by_kind: [0; 3],
             households: Vec::new(),
             household_pos: vec![u32::MAX; tile_count],
+            works: BTreeSet::new(),
         }
+    }
+
+    /// Chantiers en cours.
+    #[must_use]
+    pub fn under_construction(&self) -> usize {
+        self.works.len()
     }
 
     #[must_use]
@@ -202,7 +324,8 @@ impl Buildings {
     pub fn set_occupants(&mut self, id: BuildingId, occupants: u32) -> Option<u32> {
         let building = self.slots.get_mut(id.index()).and_then(Option::as_mut)?;
         let previous = *building;
-        building.occupants = occupants.min(building.capacity);
+        let limit = if building.complete { building.capacity } else { 0 };
+        building.occupants = occupants.min(limit);
         let updated = *building;
         self.totals.sub(&previous);
         self.totals.add(&updated);
@@ -220,8 +343,46 @@ impl Buildings {
         self.id_at_slot(tile.index())
     }
 
-    /// Construit un bâtiment. Renvoie `None` si la tuile est occupée ou hors grille.
+    /// Construit un bâtiment livré d'emblée. Renvoie `None` si la tuile est
+    /// occupée ou hors grille.
     pub fn spawn(&mut self, tile: TileId, kind: BuildingKind, capacity: u32) -> Option<BuildingId> {
+        self.insert(tile, kind, capacity, Tick::ZERO, Tick::ZERO, true)
+    }
+
+    /// Ouvre un chantier : le bâtiment occupe sa tuile dès maintenant, mais
+    /// ses logements ou emplois n'existent qu'à sa livraison
+    /// ([`Buildings::complete_due`]).
+    pub fn spawn_construction(&mut self, tile: TileId, kind: BuildingKind, capacity: u32, now: Tick) -> Option<BuildingId> {
+        let ready = Tick::new(now.raw() + kind.construction_ticks(capacity));
+        let id = self.insert(tile, kind, capacity, now, ready, false)?;
+        self.works.insert((ready.raw(), tile.raw()));
+        Some(id)
+    }
+
+    /// Livre les chantiers arrivés à échéance. Renvoie les bâtiments livrés,
+    /// dans l'ordre (date, tuile) : déterministe.
+    pub fn complete_due(&mut self, now: Tick) -> Vec<BuildingId> {
+        let mut done = Vec::new();
+        while let Some(&(ready, slot)) = self.works.first() {
+            if ready > now.raw() {
+                break;
+            }
+            self.works.pop_first();
+            let Some(building) = self.slots.get_mut(slot as usize).and_then(Option::as_mut) else {
+                continue;
+            };
+            if building.complete || building.ready_at.raw() != ready {
+                continue;
+            }
+            building.complete = true;
+            let finished = *building;
+            self.totals.add(&finished);
+            done.push(BuildingId::new(slot));
+        }
+        done
+    }
+
+    fn insert(&mut self, tile: TileId, kind: BuildingKind, capacity: u32, started_at: Tick, ready_at: Tick, complete: bool) -> Option<BuildingId> {
         debug_assert!(capacity > 0, "batiment a capacite nulle");
         let slot = self.slots.get_mut(tile.index())?;
         if slot.is_some() {
@@ -233,6 +394,9 @@ impl Buildings {
             level: 1,
             capacity,
             occupants: 0,
+            started_at,
+            ready_at,
+            complete,
         };
         *slot = Some(building);
         self.totals.add(&building);
@@ -251,6 +415,9 @@ impl Buildings {
         let removed = slot.take();
         if let Some(building) = removed {
             self.totals.sub(&building);
+            if !building.complete {
+                self.works.remove(&(building.ready_at.raw(), id.raw()));
+            }
             self.live -= 1;
             self.by_kind[building.kind.index()] -= 1;
             if building.kind == BuildingKind::Household {

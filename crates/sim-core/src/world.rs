@@ -58,6 +58,9 @@ pub struct SimConfig {
     /// `RoadClass::construction_ticks`). `false` : ouverture immédiate
     /// (scénarios de test, démo pré-construite).
     pub road_construction: bool,
+    /// Les bâtiments passent par un chantier (stades, `ConstructionStage`)
+    /// avant d'accueillir habitants et emplois. `false` : livraison immédiate.
+    pub building_construction: bool,
     pub land_value_budget_per_tick: usize,
     pub population_budget_per_tick: usize,
     /// Plancher du flux migratoire entrant, en résidents par tick.
@@ -116,6 +119,7 @@ impl Default for SimConfig {
             road_access_radius_tiles: 2,
             road_snap_radius_m: Fixed::from_int(1),
             road_construction: true,
+            building_construction: true,
             land_value_budget_per_tick: 4096,
             population_budget_per_tick: 4096,
             max_inflow_per_tick: 6,
@@ -172,6 +176,11 @@ pub enum SimEvent {
     RoundaboutBuilt {
         center: Point,
         segments: u32,
+    },
+    /// Un chantier de bâtiment est livré : logements ou emplois disponibles.
+    BuildingCompleted {
+        id: BuildingId,
+        kind: BuildingKind,
     },
     /// Des chantiers de route se sont achevés : les routes sont ouvertes.
     RoadsOpened {
@@ -420,6 +429,11 @@ impl World {
 
         self.apply_commands();
         self.open_finished_roads();
+        for id in self.buildings.complete_due(self.tick) {
+            if let Some(building) = self.buildings.get(id) {
+                self.events.push(SimEvent::BuildingCompleted { id, kind: building.kind });
+            }
+        }
         self.refresh_road_access();
 
         let land_value_budget = self.config.land_value_budget_per_tick;
@@ -821,7 +835,12 @@ impl World {
 
                 let land_value = self.land_value.get(tile);
                 let capacity = capacity_for(kind, land_value);
-                if let Some(id) = self.buildings.spawn(tile, kind, capacity) {
+                let spawned_id = if self.config.building_construction {
+                    self.buildings.spawn_construction(tile, kind, capacity, self.tick)
+                } else {
+                    self.buildings.spawn(tile, kind, capacity)
+                };
+                if let Some(id) = spawned_id {
                     self.events.push(SimEvent::BuildingBuilt {
                         id,
                         tile,
@@ -945,8 +964,9 @@ impl Default for World {
 mod tests {
     use super::*;
 
+    /// Scénarios instantanés : les chantiers ont leurs propres tests.
     fn config() -> SimConfig {
-        SimConfig::default()
+        SimConfig { road_construction: false, building_construction: false, ..SimConfig::default() }
     }
 
     #[test]

@@ -28,13 +28,13 @@
 
 use std::collections::HashMap;
 
-use sim_core::{BuildingKind, TileId, World, ZoneType};
+use sim_core::{BuildingKind, ConstructionStage, TileId, World, ZoneType};
 
 use crate::nature::{ground_altitude_m, Species, TreeSpot};
 use crate::scene::RoadStrip;
 
 /// Nombre de couches du tableau de textures urbaines.
-pub const LAYER_COUNT: usize = 25;
+pub const LAYER_COUNT: usize = 26;
 
 /// Fichiers des couches (`assets/urban/<nom>.jpg`), dans l'ordre du tableau.
 pub const LAYER_NAMES: [&str; LAYER_COUNT] = [
@@ -63,6 +63,7 @@ pub const LAYER_NAMES: [&str; LAYER_COUNT] = [
     "22_fleche",
     "23_glissiere",
     "24_balise",
+    "25_palissade",
 ];
 
 /// Taille d'une répétition de chaque couche (largeur, hauteur) en mètres :
@@ -93,6 +94,7 @@ pub const LAYER_SIZE_M: [[f32; 2]; LAYER_COUNT] = [
     [3.5, 7.0],
     [4.0, 0.32],
     [2.0, 1.0],
+    [2.5, 2.0],
 ];
 
 /// L'indice de couche est codé dans l'alpha de la couleur : `a = couche / 32`.
@@ -126,6 +128,7 @@ pub enum Layer {
     Arrow,
     Guardrail,
     Beacon,
+    Hoarding,
 }
 
 impl Layer {
@@ -243,7 +246,7 @@ impl UrbanMesh {
     /// `outward`. Les motifs sont centrés sur le mur (fenêtres symétriques)
     /// et les étages calés sur `base_y`.
     #[allow(clippy::too_many_arguments)]
-    fn wall(&mut self, a: [f32; 2], b: [f32; 2], y0: f32, y1: f32, base_y: f32, layer: Layer, tint: [f32; 3], outward: [f32; 2]) {
+    pub(crate) fn wall(&mut self, a: [f32; 2], b: [f32; 2], y0: f32, y1: f32, base_y: f32, layer: Layer, tint: [f32; 3], outward: [f32; 2]) {
         if y1 - y0 < 1e-3 {
             return;
         }
@@ -857,7 +860,19 @@ fn front_door(mesh: &mut UrbanMesh, lot: &Lot, r: f32, f: f32, floor: f32) {
 }
 
 /// Construit un bâtiment complet (parcelle comprise) dans `mesh`.
-pub fn push_building(world: &World, mesh: &mut UrbanMesh, lot: &Lot, kind: BuildingKind, capacity: u32) {
+///
+/// Un bâtiment en chantier (`stage` autre que `Complete`) montre son stade :
+/// palissade et engins, dalle, structure qui monte sous échafaudages et grue,
+/// puis bâtiment fini encore échafaudé. `within` : avancement dans le stade.
+pub fn push_building(world: &World, mesh: &mut UrbanMesh, lot: &Lot, kind: BuildingKind, capacity: u32, stage: ConstructionStage, within: f32) {
+    if stage != ConstructionStage::Complete {
+        construction_site(world, mesh, lot, kind, capacity, stage, within);
+        return;
+    }
+    finished_building(world, mesh, lot, kind, capacity);
+}
+
+fn finished_building(world: &World, mesh: &mut UrbanMesh, lot: &Lot, kind: BuildingKind, capacity: u32) {
     let (arch, floors) = archetype(kind, capacity);
     let mut dice = building_dice(lot.tile);
     match arch {
@@ -866,6 +881,231 @@ pub fn push_building(world: &World, mesh: &mut UrbanMesh, lot: &Lot, kind: Build
         Archetype::Shop | Archetype::Offices => shop(world, mesh, lot, arch, floors, &mut dice),
         Archetype::Factory => factory(world, mesh, lot, &mut dice),
     }
+}
+
+/// Emprise, plancher et hauteur de l'enveloppe d'un bâtiment : mêmes tirages
+/// que sa construction finale (le chantier montre le bon volume).
+fn shell(world: &World, lot: &Lot, arch: Archetype, floors: u32) -> (Footprint, f32, f32) {
+    let mut dice = building_dice(lot.tile);
+    let fp = match arch {
+        Archetype::House | Archetype::Townhouse => house_plan(lot, arch == Archetype::Townhouse, &mut dice),
+        Archetype::Apartments => {
+            let depth = 7.2f32.min(lot.depth() - 0.5);
+            let front = lot.ahead - dice.range(0.3, 1.0);
+            Footprint { r0: -3.7, r1: 3.7, f0: front - depth, f1: front }
+        }
+        Archetype::Shop | Archetype::Offices => {
+            let depth = 7.4f32.min(lot.depth() - 0.3);
+            let front = lot.ahead - 0.2;
+            Footprint { r0: -3.8, r1: 3.8, f0: front - depth, f1: front }
+        }
+        Archetype::Factory => {
+            let depth = 7.6f32.min(lot.depth() - 0.3);
+            let front = lot.ahead - dice.range(0.2, 0.8);
+            Footprint { r0: -3.85, r1: 3.85, f0: front - depth, f1: front }
+        }
+    };
+    let floor = floor_level(world, lot, &fp);
+    let height = match arch {
+        Archetype::House | Archetype::Townhouse | Archetype::Apartments => floors as f32 * FLOOR_M,
+        Archetype::Shop | Archetype::Offices => SHOP_FLOOR_M + floors as f32 * FLOOR_M,
+        Archetype::Factory => 8.0,
+    };
+    (fp, floor, floor + height)
+}
+
+/// Tube d'échafaudage (ou poteau) de section carrée `2r`, de `a` à `b`.
+fn tube(mesh: &mut UrbanMesh, a: [f32; 3], b: [f32; 3], r: f32, layer: Layer, tint: [f32; 3]) {
+    let axis = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len = dot(axis, axis).sqrt();
+    if len < 1e-4 {
+        return;
+    }
+    let ax = scale(axis, 1.0 / len);
+    let helper = if ax[1].abs() < 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+    let u = cross(ax, helper);
+    let u = scale(u, r / dot(u, u).sqrt());
+    let w = cross(ax, u);
+    let w = scale(w, r / dot(w, w).sqrt());
+    let corners = [add(u, w), add(scale(u, -1.0), w), add(scale(u, -1.0), scale(w, -1.0)), add(u, scale(w, -1.0))];
+    for i in 0..4 {
+        let (c0, c1) = (corners[i], corners[(i + 1) % 4]);
+        let quad = [add(a, c0), add(b, c0), add(b, c1), add(a, c1)];
+        let out = add(c0, c1);
+        let [um, vm] = layer.size_m();
+        let uv = [[0.0, 0.0], [len / um, 0.0], [len / um, r / vm], [0.0, r / vm]];
+        mesh.polygon(&quad, &uv, layer, tint, out);
+    }
+}
+
+/// Échafaudage de façade autour d'une emprise, jusqu'à `height` au-dessus
+/// du plancher : deux files de montants, moises à chaque niveau (2 m),
+/// planchers de travail.
+fn scaffolding(mesh: &mut UrbanMesh, lot: &Lot, fp: &Footprint, floor: f32, height: f32) {
+    let (gap, depth) = (0.35, 0.85);
+    let steel = [0.55, 0.57, 0.6];
+    let lifts = (height / 2.0).ceil().max(1.0) as usize;
+    for side in 0..4 {
+        // Côté de l'emprise (repère parcelle), prolongé aux angles.
+        let (r0, r1, f0, f1, normal) = match side {
+            0 => (fp.r0 - gap - depth, fp.r1 + gap + depth, fp.f0, fp.f0, [0.0, -1.0]),
+            1 => (fp.r1, fp.r1, fp.f0 - gap - depth, fp.f1 + gap + depth, [1.0, 0.0]),
+            2 => (fp.r0 - gap - depth, fp.r1 + gap + depth, fp.f1, fp.f1, [0.0, 1.0]),
+            _ => (fp.r0, fp.r0, fp.f0 - gap - depth, fp.f1 + gap + depth, [-1.0, 0.0]),
+        };
+        let at = |t: f32, off: f32, y: f32| {
+            let r = r0 + (r1 - r0) * t + normal[0] * off;
+            let f = f0 + (f1 - f0) * t + normal[1] * off;
+            let q = lot.at(r, f);
+            [q[0], y, q[1]]
+        };
+        let length = (r1 - r0).abs().max((f1 - f0).abs());
+        let bays = (length / 2.5).ceil().max(1.0) as usize;
+        for off in [gap, gap + depth] {
+            for k in 0..=bays {
+                let t = k as f32 / bays as f32;
+                tube(mesh, at(t, off, floor - 0.3), at(t, off, floor + height + 1.0), 0.03, Layer::Concrete, steel);
+            }
+            for l in 1..=lifts {
+                let y = floor + l as f32 * 2.0;
+                tube(mesh, at(0.0, off, y), at(1.0, off, y), 0.025, Layer::Concrete, steel);
+                // Garde-corps au-dessus du plancher, côté extérieur.
+                if off > gap {
+                    tube(mesh, at(0.0, off, y + 1.0), at(1.0, off, y + 1.0), 0.02, Layer::Concrete, steel);
+                }
+            }
+        }
+        for l in 1..=lifts {
+            let y = floor + l as f32 * 2.0 + 0.03;
+            let deck = [at(0.0, gap, y), at(1.0, gap, y), at(1.0, gap + depth, y), at(0.0, gap + depth, y)];
+            mesh.surface(&deck, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], Layer::Siding, [0.95, 0.72, 0.45], [0.0, 1.0, 0.0]);
+        }
+    }
+}
+
+/// Palissade le long du pourtour de la parcelle, avec un portail à l'avant.
+fn hoarding(world: &World, mesh: &mut UrbanMesh, lot: &Lot) {
+    let inset = 0.15;
+    let (r0, r1) = (-lot.half_width + inset, lot.half_width - inset);
+    let (f0, f1) = (-lot.back + inset, lot.ahead - inset);
+    let [panel, height] = Layer::Hoarding.size_m();
+    // (début, fin, normale extérieure) de chaque côté, en repère parcelle.
+    let sides = [
+        ([r0, f0], [r1, f0], [0.0, -1.0]),
+        ([r1, f0], [r1, f1], [1.0, 0.0]),
+        ([r1, f1], [r0, f1], [0.0, 1.0]),
+        ([r0, f1], [r0, f0], [-1.0, 0.0]),
+    ];
+    for (k, (a, b, n)) in sides.iter().enumerate() {
+        let length = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        let count = (length / panel).ceil().max(1.0) as usize;
+        for i in 0..count {
+            let (t0, t1) = (i as f32 / count as f32, (i + 1) as f32 / count as f32);
+            // Portail : deux panneaux ouverts au milieu du côté avant.
+            if k == 2 && count >= 3 && (i == count / 2 || (count % 2 == 0 && i + 1 == count / 2)) {
+                continue;
+            }
+            let p0 = lot.at(a[0] + (b[0] - a[0]) * t0, a[1] + (b[1] - a[1]) * t0);
+            let p1 = lot.at(a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1);
+            let g0 = ground_altitude_m(world, p0[0], p0[1]);
+            let g1 = ground_altitude_m(world, p1[0], p1[1]);
+            let low = g0.min(g1) - 0.2;
+            let top = g0.max(g1) + height;
+            let out = [lot.right[0] * n[0] + lot.front[0] * n[1], lot.right[1] * n[0] + lot.front[1] * n[1]];
+            mesh.wall(p0, p1, low, top, top - height, Layer::Hoarding, WHITE, out);
+            mesh.wall(p1, p0, low, top, top - height, Layer::Hoarding, WHITE, [-out[0], -out[1]]);
+        }
+    }
+}
+
+/// Chantier : sol de terre, palissade, et ce que montre le stade.
+#[allow(clippy::too_many_arguments)]
+fn construction_site(world: &World, mesh: &mut UrbanMesh, lot: &Lot, kind: BuildingKind, capacity: u32, stage: ConstructionStage, within: f32) {
+    let (arch, floors) = archetype(kind, capacity);
+    let (fp, floor, top) = shell(world, lot, arch, floors);
+    let mut dice = Dice(hash(u64::from(lot.tile.raw()) ^ 0x517E_C0DE));
+    let whole = Footprint { r0: -lot.half_width, r1: lot.half_width, f0: -lot.back, f1: lot.ahead };
+    ground_patch(world, mesh, lot, &whole, Layer::Works, WHITE, 0.09);
+    hoarding(world, mesh, lot);
+    let models = crate::site::SiteModels::get();
+    let big = top - floor > 7.0;
+    // Une grue dessert plusieurs parcelles : une sur six environ en a une.
+    let crane = big && dice.chance(0.17);
+    let excavator = dice.chance(0.5);
+    let cabin = big && dice.chance(0.3);
+    let ground_at = |r: f32, f: f32| {
+        let q = lot.at(r, f);
+        [q[0], ground_altitude_m(world, q[0], q[1]), q[1]]
+    };
+    // Orientation des engins : le long de la façade, en radians autour de Y.
+    let along = lot.right[1].atan2(lot.right[0]);
+    let crane_spot = || {
+        let q = lot.at(fp.r0 + 1.3, fp.f0 + 1.3);
+        [q[0], floor - 0.3, q[1]]
+    };
+    match stage {
+        ConstructionStage::SitePreparation | ConstructionStage::Foundations => {
+            // Terrassement : la pelleteuse travaille, le bungalow de chantier
+            // attend sur les grands chantiers.
+            // Le bras (6 m vers +X du modèle) travaille vers le fond de la
+            // parcelle : la machine reste chez elle.
+            let back_yaw = (-lot.front[1]).atan2(-lot.front[0]);
+            let ef = (lot.ahead - 3.1).min(fp.f1);
+            if excavator {
+                push_excavator(mesh, ground_at(dice.range(-0.8, 0.8), ef), back_yaw + dice.range(-0.15, 0.15));
+            }
+            if cabin {
+                let q = ground_at(0.0, -lot.back + 1.4);
+                crate::site::push_prop(mesh, &models.cabin, q, -along);
+            }
+            if stage == ConstructionStage::Foundations {
+                // Dalle coulée progressivement depuis l'arrière, coffrage autour.
+                let poured = Footprint { f1: fp.f0 + (fp.f1 - fp.f0) * within.max(0.15), ..fp };
+                cuboid(mesh, lot, &poured, floor - 0.8, floor, Layer::Concrete, Layer::Concrete, [0.78, 0.77, 0.74]);
+                walls(mesh, lot, &Footprint { r0: fp.r0 - 0.1, r1: fp.r1 + 0.1, f0: fp.f0 - 0.1, f1: fp.f1 + 0.1 }, floor - 0.8, floor + 0.25, floor, Layer::Siding, Layer::Siding, [0.85, 0.65, 0.4]);
+            }
+        }
+        ConstructionStage::Structure => {
+            let built = floor + (top - floor) * within.clamp(0.05, 1.0);
+            cuboid(mesh, lot, &fp, floor - 0.8, floor, Layer::Concrete, Layer::Concrete, [0.78, 0.77, 0.74]);
+            // Murs montés jusqu'au niveau sous la dalle en cours.
+            let level_h = if matches!(arch, Archetype::Shop | Archetype::Offices) { SHOP_FLOOR_M } else { FLOOR_M };
+            let walls_to = (built - FLOOR_M).max(floor);
+            let block = if matches!(arch, Archetype::House | Archetype::Townhouse) { (Layer::Brick, [0.95, 0.9, 0.85]) } else { (Layer::Concrete, [0.86, 0.85, 0.82]) };
+            if walls_to > floor + 0.5 {
+                walls(mesh, lot, &fp, floor, walls_to, floor, block.0, block.0, block.1);
+            }
+            // Dalles des niveaux atteints et poteaux jusqu'au front de pose.
+            let mut y = floor + level_h;
+            while y <= built + 0.01 {
+                cuboid(mesh, lot, &fp, y - 0.25, y, Layer::Concrete, Layer::Concrete, [0.8, 0.79, 0.76]);
+                y += FLOOR_M;
+            }
+            for (r, f) in [(fp.r0, fp.f0), (fp.r1, fp.f0), (fp.r1, fp.f1), (fp.r0, fp.f1), ((fp.r0 + fp.r1) * 0.5, fp.f0), ((fp.r0 + fp.r1) * 0.5, fp.f1)] {
+                let col = Footprint { r0: r - 0.18, r1: r + 0.18, f0: f - 0.18, f1: f + 0.18 };
+                let col = Footprint { r0: col.r0.max(fp.r0), r1: col.r1.min(fp.r1), f0: col.f0.max(fp.f0), f1: col.f1.min(fp.f1) };
+                cuboid(mesh, lot, &col, floor, built, Layer::Concrete, Layer::Concrete, [0.8, 0.79, 0.76]);
+            }
+            scaffolding(mesh, lot, &fp, floor, built - floor);
+            if crane {
+                crate::site::push_crane(mesh, crane_spot(), top - floor + 9.0, dice.range(0.0, std::f32::consts::TAU));
+            }
+        }
+        ConstructionStage::Finishing | ConstructionStage::Complete => {
+            finished_building(world, mesh, lot, kind, capacity);
+            // Les échafaudages descendent à mesure que les façades sont finies.
+            if within < 0.75 {
+                scaffolding(mesh, lot, &fp, floor, top - floor);
+            }
+            if crane && within < 0.35 {
+                crate::site::push_crane(mesh, crane_spot(), top - floor + 9.0, dice.range(0.0, std::f32::consts::TAU));
+            }
+        }
+    }
+}
+
+fn push_excavator(mesh: &mut UrbanMesh, at: [f32; 3], yaw: f32) {
+    crate::site::push_prop(mesh, &crate::site::SiteModels::get().excavator, at, yaw);
 }
 
 /// Emprise d'une maison : premiers tirages de sa graine (partagés avec
@@ -1084,11 +1324,23 @@ pub fn buildings_in(world: &World, roads: &RoadIndex, x0: u32, y0: u32, x1: u32,
                 continue;
             };
             if let Some(lot) = lot_for(world, roads, tile) {
-                push_building(world, &mut mesh, &lot, building.kind, building.capacity);
+                let (stage, within) = building.stage(world.current_tick());
+                push_building(world, &mut mesh, &lot, building.kind, building.capacity, stage, within.to_f32());
             }
         }
     }
     mesh
+}
+
+/// Pas d'avancement *visible* d'un chantier : la géométrie ne change qu'à
+/// ces paliers, inutile de reconstruire entre deux.
+fn visual_step(stage: ConstructionStage, within: f32) -> u64 {
+    match stage {
+        ConstructionStage::Foundations => (within * 3.0) as u64,
+        ConstructionStage::Structure => (within * 4.0) as u64,
+        ConstructionStage::Finishing => u64::from(within >= 0.35) + u64::from(within >= 0.75),
+        _ => 0,
+    }
 }
 
 /// Empreinte des bâtiments d'un carré de tuiles : change dès qu'un bâtiment
@@ -1096,13 +1348,17 @@ pub fn buildings_in(world: &World, roads: &RoadIndex, x0: u32, y0: u32, x1: u32,
 #[must_use]
 pub fn buildings_signature(world: &World, x0: u32, y0: u32, x1: u32, y1: u32) -> u64 {
     let grid = world.zoning().grid();
+    let now = world.current_tick();
     let mut signature = 0xC17E_u64;
     for y in y0..y1.min(grid.height()) {
         for x in x0..x1.min(grid.width()) {
             let Some(tile) = grid.tile_at(x, y) else { continue };
             if let Some(building) = world.buildings().at(tile).and_then(|id| world.buildings().get(id)) {
                 let kind = building.kind as u64;
-                signature = hash(signature ^ (u64::from(tile.raw()) << 20) ^ (kind << 16) ^ u64::from(building.capacity));
+                // Chantier : stade, et quart d'avancement (la structure monte).
+                let (stage, within) = building.stage(now);
+                let step = (stage as u64) << 8 | visual_step(stage, within.to_f32());
+                signature = hash(signature ^ (u64::from(tile.raw()) << 20) ^ (kind << 16) ^ u64::from(building.capacity) ^ (step << 40));
             }
         }
     }
@@ -1176,8 +1432,9 @@ mod tests {
     use crate::scene;
 
     fn city() -> World {
+        // Même pré-simulation que le viewer : chantiers livrés et en cours.
         let mut world = scene::demo_city();
-        for _ in 0..600 {
+        for _ in 0..2_400 {
             world.tick();
         }
         world
@@ -1191,7 +1448,7 @@ mod tests {
             let entry = format!("(\"{name}\", {w:?}, {h:?})");
             assert!(script.contains(&entry), "couche {name} absente ou de taille différente : {entry}");
         }
-        assert_eq!(Layer::Beacon.index(), LAYER_COUNT - 1);
+        assert_eq!(Layer::Hoarding.index(), LAYER_COUNT - 1);
     }
 
     #[test]
@@ -1226,15 +1483,23 @@ mod tests {
                 continue;
             };
             let mut mesh = UrbanMesh::default();
-            push_building(&world, &mut mesh, &lot, building.kind, building.capacity);
+            let (stage, within) = building.stage(world.current_tick());
+            push_building(&world, &mut mesh, &lot, building.kind, building.capacity, stage, within.to_f32());
             assert!(!mesh.is_empty() && mesh.is_sane());
-            assert!(mesh.vertex_count() < 600, "{:?} trop lourd : {}", building.kind, mesh.vertex_count());
+            let budget = if building.complete { 600 } else { 12_000 };
+            assert!(mesh.vertex_count() < budget, "{:?} ({stage:?}) trop lourd : {}", building.kind, mesh.vertex_count());
             kinds.insert(archetype(building.kind, building.capacity).0);
-            // Le bâti (hors parcelle) ne mord ni sur la chaussée ni sur le trottoir.
+            // Le bâti (hors parcelle) ne mord ni sur la chaussée ni sur le
+            // trottoir. Sur un chantier, seule la flèche de grue survole la
+            // rue : on vérifie ce qui est au sol (palissade, engins).
             let ground = ground_altitude_m(&world, lot.center[0], lot.center[1]);
-            for p in mesh.positions.iter().filter(|p| p[1] > ground + 2.5) {
+            let band = if building.complete { (ground + 2.5, f32::INFINITY) } else { (ground - 5.0, ground + 2.5) };
+            for p in mesh.positions.iter().filter(|p| p[1] > band.0 && p[1] < band.1) {
                 let clearance = roads.clearance([p[0], p[2]], 30.0);
-                assert!(clearance > -0.5, "bâtiment sur la route en {p:?} ({clearance})");
+                // Un échafaudage peut empiéter d'un mètre sur le trottoir
+                // (jamais sur la chaussée : trottoirs de 2 m et plus).
+                let limit = if building.complete { -0.5 } else { -1.5 };
+                assert!(clearance > limit, "{stage:?} sur la route en {p:?} ({clearance})");
             }
         }
         assert!(kinds.len() >= 3, "trop peu de variété : {kinds:?}");
@@ -1262,10 +1527,11 @@ mod tests {
         let grid = world.zoning().grid();
         // Murs et toits de chaque bâtiment, par tuile.
         let mut walls: HashMap<(u32, u32), Vec<[f32; 3]>> = HashMap::new();
-        for (_, building) in world.buildings().iter() {
+        for (_, building) in world.buildings().iter().filter(|(_, b)| b.complete) {
             let Some(lot) = lot_for(&world, &roads, building.tile) else { continue };
             let mut mesh = UrbanMesh::default();
-            push_building(&world, &mut mesh, &lot, building.kind, building.capacity);
+            let (stage, within) = building.stage(world.current_tick());
+            push_building(&world, &mut mesh, &lot, building.kind, building.capacity, stage, within.to_f32());
             let ground = ground_altitude_m(&world, lot.center[0], lot.center[1]);
             let high: Vec<_> = mesh.positions.into_iter().filter(|p| p[1] > ground + 2.0).collect();
             walls.insert(grid.xy(building.tile).unwrap(), high);
@@ -1299,6 +1565,48 @@ mod tests {
             }
         }
         assert!(street > 200, "trop peu d'arbres d'alignement : {street}");
+    }
+
+    #[test]
+    fn every_construction_stage_shows_its_site() {
+        let world = city();
+        let roads = RoadIndex::new(&scene::roads(&world));
+        let lot = world.buildings().iter().find_map(|(_, b)| lot_for(&world, &roads, b.tile)).unwrap();
+        let tall = BuildingKind::Household;
+        let mut previous_height = 0.0f32;
+        for (stage, within) in [
+            (ConstructionStage::SitePreparation, 0.5),
+            (ConstructionStage::Foundations, 0.5),
+            (ConstructionStage::Structure, 0.2),
+            (ConstructionStage::Structure, 0.9),
+            (ConstructionStage::Finishing, 0.9),
+        ] {
+            let mut mesh = UrbanMesh::default();
+            push_building(&world, &mut mesh, &lot, tall, 48, stage, within);
+            assert!(mesh.is_sane(), "{stage:?}");
+            let layers: std::collections::HashSet<usize> =
+                mesh.colors.iter().map(|c| (c[3] * LAYER_ENCODING).round() as usize).collect();
+            assert!(layers.contains(&Layer::Hoarding.index()), "{stage:?} : palissade");
+            assert!(layers.contains(&Layer::Works.index()), "{stage:?} : terre");
+            // La structure monte d'un stade à l'autre (hors grue : sous 25 m).
+            let ground = ground_altitude_m(&world, lot.center[0], lot.center[1]);
+            let height = mesh
+                .positions
+                .iter()
+                .filter(|p| p[1] < ground + 25.0)
+                .map(|p| p[1] - ground)
+                .fold(0.0, f32::max);
+            if stage == ConstructionStage::Structure {
+                assert!(height >= previous_height - 0.01, "{stage:?} {within} : {height} < {previous_height}");
+            }
+            previous_height = height;
+        }
+        // Un immeuble en gros œuvre a sa grue (bien au-dessus du bâtiment).
+        let mut mesh = UrbanMesh::default();
+        push_building(&world, &mut mesh, &lot, tall, 48, ConstructionStage::Structure, 0.5);
+        let ground = ground_altitude_m(&world, lot.center[0], lot.center[1]);
+        let top = mesh.positions.iter().map(|p| p[1] - ground).fold(0.0, f32::max);
+        assert!(top > 25.0, "grue absente : {top} m");
     }
 
     #[test]

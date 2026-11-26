@@ -48,10 +48,11 @@ fn run(world: &mut World, ticks: u32) {
 }
 
 
-/// Configuration des scénarios : routes ouvertes dès leur tracé. Le chantier
-/// routier a ses propres tests (`road_works_*`).
+/// Configuration des scénarios : routes ouvertes dès leur tracé, bâtiments
+/// livrés d'emblée. Les chantiers ont leurs propres tests (`road_works_*`,
+/// `building_works_*`).
 fn instant_roads() -> SimConfig {
-    SimConfig { road_construction: false, ..SimConfig::default() }
+    SimConfig { road_construction: false, building_construction: false, ..SimConfig::default() }
 }
 
 #[test]
@@ -609,7 +610,8 @@ fn generated_world_grows_on_dry_land_only() {
 
 #[test]
 fn road_works_delay_access_until_the_road_opens() {
-    let mut world = World::new(SimConfig::default(), 21, Terrain::flat(32, 32));
+    let config = SimConfig { building_construction: false, ..SimConfig::default() };
+    let mut world = World::new(config, 21, Terrain::flat(32, 32));
     world.queue(Command::BuildRoad {
         from: Point::new(tile_center_m(2), tile_center_m(10)),
         to: Point::new(tile_center_m(28), tile_center_m(10)),
@@ -690,4 +692,68 @@ fn roundabouts_are_closed_one_way_rings_that_streets_can_join() {
     let street = roads.segments().find(|(_, s)| !s.spec.is_one_way()).unwrap().1;
     assert!(street.a == east || street.b == east);
     assert!(street.curve.is_straight());
+}
+
+#[test]
+fn building_works_go_through_every_stage_before_housing_anyone() {
+    use sim_core::{ConstructionStage, SimEvent};
+    let config = SimConfig { road_construction: false, ..SimConfig::default() };
+    let mut world = World::new(config, 31, Terrain::flat(32, 32));
+    world.queue(Command::BuildRoad {
+        from: Point::new(tile_center_m(2), tile_center_m(10)),
+        to: Point::new(tile_center_m(28), tile_center_m(10)),
+        spec: RoadSpec::TWO_WAY,
+    });
+    world.queue(Command::ZoneRect { rect: Rect::new(3, 11, 26, 12), zone: ZoneType::Residential });
+    let mut stages_seen = std::collections::BTreeSet::new();
+    let mut completed = 0u32;
+    for _ in 0..3_000 {
+        let report = world.tick();
+        let now = world.current_tick();
+        for event in &report.events {
+            if let SimEvent::BuildingCompleted { id, .. } = event {
+                completed += 1;
+                assert!(world.buildings().get(*id).unwrap().complete);
+            }
+        }
+        for (_, b) in world.buildings().iter() {
+            let (stage, within) = b.stage(now);
+            stages_seen.insert(stage);
+            assert!(within >= Fixed::ZERO && within <= Fixed::ONE);
+            // Un chantier ne loge personne.
+            if !b.complete {
+                assert_eq!(b.occupants, 0);
+                assert_eq!(b.free_slots(), 0);
+            }
+        }
+        // Les agrégats ne comptent que les bâtiments livrés.
+        let housing: u32 = world.buildings().iter().filter(|(_, b)| b.complete && b.is_household()).map(|(_, b)| b.capacity).sum();
+        assert_eq!(world.buildings().totals().housing_capacity, housing);
+    }
+    assert_eq!(stages_seen.len(), 5, "tous les stades vus : {stages_seen:?}");
+    assert!(completed > 0);
+    assert!(world.snapshot().population > 0, "les habitants arrivent après la livraison");
+}
+
+#[test]
+fn demolishing_a_building_site_cancels_its_delivery() {
+    let config = SimConfig { road_construction: false, ..SimConfig::default() };
+    let mut world = World::new(config, 32, Terrain::flat(32, 32));
+    world.queue(Command::BuildRoad {
+        from: Point::new(tile_center_m(2), tile_center_m(10)),
+        to: Point::new(tile_center_m(28), tile_center_m(10)),
+        spec: RoadSpec::TWO_WAY,
+    });
+    world.queue(Command::ZoneRect { rect: Rect::new(3, 11, 26, 11), zone: ZoneType::Residential });
+    while world.buildings().live_count() == 0 {
+        world.tick();
+    }
+    world.queue(Command::BulldozeRect { rect: Rect::new(0, 0, 31, 31) });
+    world.tick();
+    assert_eq!(world.buildings().live_count(), 0);
+    assert_eq!(world.buildings().under_construction(), 0);
+    for _ in 0..3_000 {
+        let report = world.tick();
+        assert!(!report.events.iter().any(|e| matches!(e, sim_core::SimEvent::BuildingCompleted { .. })));
+    }
 }
