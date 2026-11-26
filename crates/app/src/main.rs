@@ -11,6 +11,8 @@
 
 use std::time::Duration;
 
+use city_ui::{text, Arg, Localizer};
+
 use sim_core::{
     tile_center_m, Command, Fixed, Overlay, Point, Rect, RoadSpec, SimConfig, SimEvent, Terrain,
     World, ZoneType, TILE_SIZE_M,
@@ -52,14 +54,22 @@ fn main() {
     zone(&mut world, 16, 8, 34, 9, ZoneType::Commercial);
     zone(&mut world, 11, 32, 14, 40, ZoneType::Industrial);
 
+    // Tout texte affiché passe par les fichiers de langue (locales/en).
+    let loc = Localizer::english();
     println!(
-        "Carte {}x{} tuiles de {TILE_SIZE_M} m — tick {:.0} Hz, {} ticks/jour",
-        world.terrain().width(),
-        world.terrain().height(),
-        1.0 / 0.05,
-        world.config().ticks_per_day
+        "{}",
+        loc.format(
+            "demo-map-info",
+            &[
+                ("width", Arg::from(world.terrain().width())),
+                ("height", Arg::from(world.terrain().height())),
+                ("tile", Arg::from(TILE_SIZE_M)),
+                ("hz", Arg::from(config.tick_hz)),
+                ("ticks", Arg::from(world.config().ticks_per_day)),
+            ],
+        )
     );
-    print_header();
+    print_header(&loc);
 
     let mut clock = sim_core::FixedStepClock::from_hz(config.tick_hz);
     let frame = Duration::from_millis(16);
@@ -72,15 +82,21 @@ fn main() {
             for event in &report.events {
                 match event {
                     SimEvent::BudgetSettled { report } => println!(
-                        "  $ budget mois {} : +{:.0} / -{:.0} = {:+} -> {:.0} $",
-                        world.treasury().month_count,
-                        report.income_cents as f32 / 100.0,
-                        report.expenses_cents as f32 / 100.0,
-                        report.net_cents / 100,
-                        report.funds_cents as f32 / 100.0
+                        "  {}",
+                        loc.format(
+                            "demo-budget-line",
+                            &[
+                                ("month", Arg::from(world.treasury().month_count)),
+                                ("income", Arg::from(report.income_cents / 100)),
+                                ("expenses", Arg::from(report.expenses_cents / 100)),
+                                ("net", Arg::from(format!("{:+}", report.net_cents / 100))),
+                                ("funds", Arg::from(report.funds_cents / 100)),
+                            ],
+                        )
                     ),
                     SimEvent::CommandRejected { error } => {
-                        println!("  ! commande refusée : {error}");
+                        let reason = text::command_error(&loc, error);
+                        println!("  {}", loc.format("demo-rejected", &[("reason", Arg::from(reason))]));
                     }
                     _ => {}
                 }
@@ -92,20 +108,30 @@ fn main() {
     }
 
     print_snapshot(&world);
-    print_overlay_sample(&world);
+    print_overlay_sample(&world, &loc);
 }
 
-fn print_header() {
-    println!(
-        "  {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>9}",
-        "tick", "pop", "capac", "emplois", "chom.", "bonheur", "demR", "demC", "demI", "fonds($)"
-    );
+fn print_header(loc: &Localizer) {
+    let columns = [
+        "stat-tick",
+        "stat-population",
+        "stat-housing-capacity",
+        "stat-jobs",
+        "stat-unemployed",
+        "stat-happiness",
+        "stat-demand-residential",
+        "stat-demand-commercial",
+        "stat-demand-industrial",
+        "stat-funds",
+    ];
+    let line: Vec<String> = columns.iter().map(|key| format!("{:>12}", loc.text(key))).collect();
+    println!("  {}", line.join(""));
 }
 
 fn print_snapshot(world: &World) {
     let s = world.snapshot();
     println!(
-        "  {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>9}",
+        "  {:>12}{:>12}{:>12}{:>12}{:>12}{:>12.3}{:>12.3}{:>12.3}{:>12.3}{:>12}",
         s.tick.raw(),
         s.population,
         s.housing_capacity,
@@ -119,30 +145,43 @@ fn print_snapshot(world: &World) {
     );
 }
 
-fn print_overlay_sample(world: &World) {
+fn print_overlay_sample(world: &World, loc: &Localizer) {
     let snapshot = world.snapshot();
+    println!();
     println!(
-        "\nBâtiments: {}, segments: {}, valeur foncière moyenne (zonée): {}",
-        snapshot.buildings,
-        snapshot.road_segments,
-        snapshot.average_land_value
+        "{}",
+        loc.format(
+            "demo-summary",
+            &[
+                ("buildings", Arg::from(snapshot.buildings)),
+                ("segments", Arg::from(snapshot.road_segments)),
+                ("value", Arg::from(snapshot.average_land_value.to_string())),
+            ],
+        )
     );
     println!(
-        "Jours écoulés: {}, mois: {}, heure: {}h",
-        snapshot.day, snapshot.month, snapshot.hour
+        "{}",
+        loc.format(
+            "demo-calendar",
+            &[
+                ("day", Arg::from(snapshot.day)),
+                ("month", Arg::from(snapshot.month)),
+                ("hour", Arg::from(snapshot.hour)),
+            ],
+        )
     );
 
     let mut implemented = Vec::new();
     let mut planned = Vec::new();
     for overlay in Overlay::ALL {
         if overlay.is_implemented() {
-            implemented.push(overlay.label());
+            implemented.push(text::overlay(loc, overlay));
         } else {
-            planned.push(overlay.label());
+            planned.push(text::overlay(loc, overlay));
         }
     }
-    println!("Overlays prêts      : {}", implemented.join(", "));
-    println!("Overlays à venir    : {}", planned.join(", "));
+    println!("{}", loc.format("demo-overlays-ready", &[("list", Arg::from(implemented.join(", ")))]));
+    println!("{}", loc.format("demo-overlays-planned", &[("list", Arg::from(planned.join(", ")))]));
 
     // Échantillon d'overlay : la tuile sous le premier logement construit.
     let sample = world.buildings().iter().next().map(|(_, b)| b.tile);
@@ -155,7 +194,16 @@ fn print_overlay_sample(world: &World) {
             .overlay_cell(Overlay::RoadAccess, tile)
             .unwrap_or(Fixed::ZERO);
         println!(
-            "Échantillon tuile {tile} : zone={zone}, valeur={value}, desserte={access}"
+            "{}",
+            loc.format(
+                "demo-tile-sample",
+                &[
+                    ("tile", Arg::from(tile.raw())),
+                    ("zone", Arg::from(zone.to_string())),
+                    ("value", Arg::from(value.to_string())),
+                    ("access", Arg::from(access.to_string())),
+                ],
+            )
         );
     }
 }

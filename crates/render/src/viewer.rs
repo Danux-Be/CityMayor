@@ -111,10 +111,12 @@ pub fn run() {
     }
     let tour = std::env::var_os("CITYMAYOR_TOUR").is_some();
 
+    // Langue de l'interface : anglais pour l'instant (fichiers `locales/`).
+    let texts = city_i18n::Localizer::english();
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
-            title: "CityMayor".into(),
+            title: texts.text("window-title"),
             resolution: (1600u32, 900u32).into(),
             ..default()
         }),
@@ -130,6 +132,7 @@ pub fn run() {
     ))
     .insert_resource(ClearColor(srgb(nature::HORIZON_COLOR)))
     .insert_resource(Sim::new(world))
+    .insert_resource(Texts(texts))
     .insert_resource(Handles::default())
     .insert_resource(City::default())
     .insert_resource(Tour::new(tour))
@@ -160,6 +163,18 @@ fn disabled(feature: &str) -> bool {
 
 fn srgb(c: [f32; 3]) -> Color {
     Color::srgb(c[0], c[1], c[2])
+}
+
+/// Textes de l'interface dans la langue choisie (le HUD les lira).
+#[derive(Resource, Debug)]
+#[allow(dead_code)]
+struct Texts(city_i18n::Localizer);
+
+impl std::ops::Deref for Texts {
+    type Target = city_i18n::Localizer;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// État de simulation possédé par la couche de présentation.
