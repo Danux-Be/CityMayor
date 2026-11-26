@@ -64,6 +64,7 @@ LAYERS = [
     ("22_fleche", 3.5, 7.0),
     ("23_glissiere", 4.0, 0.32),
     ("24_balise", 2.0, 1.0),
+    ("25_palissade", 2.5, 2.0),
 ]
 
 # Taille réelle (m) des photos Poly Haven : on les répète un nombre entier de
@@ -538,6 +539,21 @@ def layer_beacon(scene):
         quad("bande", [(x0, -M, 0), (x0 + 0.25, -M, 0), (x0 + 0.25 + 0.4, h + M, 0), (x0 + 0.4, h + M, 0)], mat)
 
 
+def layer_hoarding(scene):
+    """Palissade de chantier : panneaux de contreplaqué peints, poteaux, lisse."""
+    w, h = 2.5, 2.0
+    board = photo("painted_plaster_wall", w, h, tint=(0.95, 0.96, 0.94), saturation=0.1, value=1.1, normal_strength=0.4)
+    green = flat("vert", (0.12, 0.32, 0.2), 0.6)
+    post = flat("poteau", (0.3, 0.31, 0.32), 0.5, 0.6)
+    quad("panneaux", [(-M, -M, 0), (w + M, -M, 0), (w + M, h + M, 0), (-M, h + M, 0)], board)
+    box("plinthe", -M, 0.0, 0.0, w + M, 0.35, 0.02, green)
+    box("bandeau", -M, 1.75, 0.0, w + M, 1.9, 0.02, green)
+    for x in (0.0, 1.25, 2.5):
+        box("joint", x - 0.01, 0.35, 0.0, x + 0.01, 1.75, 0.01, flat("joint", (0.35, 0.36, 0.35), 0.8))
+    for x in (0.0, 2.5):
+        box("poteau", x - 0.05, 0.0, 0.02, x + 0.05, h + M, 0.09, post)
+
+
 def layer_door(scene):
     w, h = 1.6, 2.8
     surround = flat("encadrement", (0.78, 0.76, 0.72), 0.8)
@@ -593,6 +609,7 @@ def main():
         "22_fleche": layer_arrow,
         "23_glissiere": layer_guardrail,
         "24_balise": layer_beacon,
+        "25_palissade": layer_hoarding,
     }
     only = set(ARGS[1:])
     for name, w, h in LAYERS:

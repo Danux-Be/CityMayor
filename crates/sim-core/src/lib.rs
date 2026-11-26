@@ -64,7 +64,7 @@ pub mod world;
 pub mod worldgen;
 pub mod zoning;
 
-pub use building::{Building, BuildingKind, BuildingTotals, Buildings};
+pub use building::{Building, BuildingKind, BuildingTotals, Buildings, ConstructionStage};
 pub use command::{Command, CommandError, Rect};
 pub use demand::{Demand, DemandParams};
 pub use economy::{BudgetParams, BudgetReport, Treasury};
