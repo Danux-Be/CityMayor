@@ -109,6 +109,18 @@ pub enum CommandError {
     Road(RoadError),
 }
 
+impl CommandError {
+    /// Clé du message affiché au joueur (fichiers de langue). `Display` reste
+    /// un texte de diagnostic pour les journaux, jamais montré en jeu.
+    #[must_use]
+    pub const fn message_key(&self) -> &'static str {
+        match self {
+            CommandError::OutOfBounds => "error-out-of-bounds",
+            CommandError::Road(inner) => inner.message_key(),
+        }
+    }
+}
+
 impl core::fmt::Display for CommandError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {

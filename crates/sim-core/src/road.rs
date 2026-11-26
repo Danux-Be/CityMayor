@@ -155,6 +155,34 @@ pub enum RoadError {
     DegenerateLength,
 }
 
+impl RoadError {
+    /// Clé du message affiché au joueur (fichiers de langue).
+    #[must_use]
+    pub const fn message_key(&self) -> &'static str {
+        match self {
+            RoadError::UnknownNode(_) => "error-road-unknown-node",
+            RoadError::UnknownSegment(_) => "error-road-unknown-segment",
+            RoadError::SelfLoop => "error-road-self-loop",
+            RoadError::DuplicateSegment => "error-road-duplicate",
+            RoadError::NoLanes => "error-road-no-lanes",
+            RoadError::ZeroSpeed => "error-road-zero-speed",
+            RoadError::DegenerateLength => "error-road-too-short",
+        }
+    }
+
+    /// Toutes les variantes (valeurs d'exemple pour les identifiants) : sert
+    /// aux tests de complétude des fichiers de langue.
+    pub const ALL: [RoadError; 7] = [
+        RoadError::UnknownNode(NodeId::new(0)),
+        RoadError::UnknownSegment(SegmentId::new(0)),
+        RoadError::SelfLoop,
+        RoadError::DuplicateSegment,
+        RoadError::NoLanes,
+        RoadError::ZeroSpeed,
+        RoadError::DegenerateLength,
+    ];
+}
+
 impl core::fmt::Display for RoadError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
