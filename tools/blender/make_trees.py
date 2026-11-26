@@ -41,7 +41,9 @@ class Builder:
 
     def __init__(self):
         self.bm = bmesh.new()
-        self.color = self.bm.loops.layers.float_color.new("Col")
+        # Couleur **par sommet** (et non par coin de face) : sinon l'export
+        # glTF duplique chaque sommet par face (×3 sommets, mesuré).
+        self.color = self.bm.verts.layers.float_color.new("Col")
         # Normale voulue par sommet (None : normale géométrique).
         self.custom_normals = {}
 
@@ -56,8 +58,8 @@ class Builder:
             f = self.bm.faces.new(verts)
         except ValueError:
             return None
-        for loop, color in zip(f.loops, colors):
-            loop[self.color] = (*color, 1.0)
+        for vert, color in zip(verts, colors):
+            vert[self.color] = (*color, 1.0)
         return f
 
 
@@ -257,6 +259,9 @@ def build_object(name, builder):
     for v in mesh.vertices:
         n = by_index.get(v.index)
         normals.append(tuple(n) if n is not None else tuple(v.normal))
+    # Ombrage lisse : avec l'ombrage plat, chaque face impose sa normale et
+    # l'export duplique les sommets ; nos normales par sommet suffisent.
+    mesh.shade_smooth()
     mesh.normals_split_custom_set_from_vertices(normals)
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.scene.collection.objects.link(obj)

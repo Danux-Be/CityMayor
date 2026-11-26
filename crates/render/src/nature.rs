@@ -526,6 +526,41 @@ pub fn build_trees(spots: &[TreeSpot], lod: TreeLod, models: &TreeModels, origin
     chunk
 }
 
+/// Distances de fondu `(apparition, disparition)` d'un niveau de détail, en
+/// mètres de la caméra à l'origine de la cellule.
+#[must_use]
+pub const fn tree_lod_distances(lod: TreeLod) -> ((f32, f32), (f32, f32)) {
+    match lod {
+        TreeLod::Model => ((0.0, 0.0), (220.0, 350.0)),
+        TreeLod::Reduced => ((220.0, 350.0), (1_150.0, 1_450.0)),
+        TreeLod::Silhouette => ((1_150.0, 1_450.0), (7_000.0, 8_000.0)),
+    }
+}
+
+/// Marge (m) entre la fin de visibilité d'un niveau et le moment où on le
+/// construit : la cellule est prête avant d'entrer dans le champ.
+pub const STREAM_MARGIN_M: f32 = 120.0;
+/// Hystérésis (m) avant de libérer un niveau : pas de construction/libération
+/// en boucle quand la caméra oscille autour d'une limite.
+pub const STREAM_HYSTERESIS_M: f32 = 150.0;
+
+/// Les niveaux « modèle » et « allégé » d'une cellule doivent-ils exister,
+/// pour une caméra à `distance` mètres de son origine ? `built` : état actuel
+/// (pour l'hystérésis). Les silhouettes, elles, existent toujours.
+///
+/// Pourquoi du streaming : construire le modèle complet pour tous les arbres
+/// (300 000 dans le décor) demandait des Go et a fait tuer le terminal par
+/// oomd. Seules les cellules proches de la caméra en ont besoin.
+#[must_use]
+pub fn streamed_lod_wanted(lod: TreeLod, distance: f32, built: bool) -> bool {
+    let reach = tree_lod_distances(lod).1 .1 + STREAM_MARGIN_M;
+    match lod {
+        TreeLod::Silhouette => true,
+        _ if built => distance < reach + STREAM_HYSTERESIS_M,
+        _ => distance < reach,
+    }
+}
+
 /// Centre (moyenne des pieds) d'un ensemble d'arbres : origine commune des
 /// trois niveaux de détail, pour que leurs fondus coïncident exactement.
 #[must_use]
@@ -961,6 +996,54 @@ mod tests {
                 assert!(model.normals.iter().all(|n| ((n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() - 1.0).abs() < 0.02));
             }
         }
+    }
+
+    #[test]
+    fn forest_geometry_fits_in_memory() {
+        // Garde-fou : la version qui construisait le modèle complet partout
+        // dépassait 170 M de sommets et faisait tuer le terminal par oomd.
+        // Pire cas : caméra posée sur la cellule la plus boisée.
+        let world = demo_city();
+        let models = TreeModels::embedded();
+        let vertices = |lod: TreeLod, species: Species| match lod {
+            TreeLod::Model => models.model[species.index()].positions.len(),
+            TreeLod::Reduced => models.reduced[species.index()].positions.len(),
+            TreeLod::Silhouette => {
+                let spot = TreeSpot { base: [0.0; 3], species, scale: 1.0, tint: 0.5, angle: 0.0 };
+                build_trees(&[spot], TreeLod::Silhouette, &models, [0.0; 3]).positions.len()
+            }
+        };
+        let mut cells: Vec<Vec<TreeSpot>> = decor_tree_cells(&world, 500.0);
+        cells.extend(play_area_tree_cells(&world, 256.0).into_iter().map(|c| c.into_iter().map(|(s, _)| s).collect()));
+        let centers: Vec<[f32; 3]> = cells.iter().map(|c| spots_center(c)).collect();
+        let silhouettes: usize = cells.iter().flatten().map(|s| vertices(TreeLod::Silhouette, s.species)).sum();
+        let mut worst = 0usize;
+        for eye in &centers {
+            let mut streamed = 0usize;
+            for (cell, center) in cells.iter().zip(&centers) {
+                let d = ((eye[0] - center[0]).powi(2) + (eye[2] - center[2]).powi(2)).sqrt();
+                for lod in [TreeLod::Model, TreeLod::Reduced] {
+                    if streamed_lod_wanted(lod, d, true) {
+                        streamed += cell.iter().map(|s| vertices(lod, s.species)).sum::<usize>();
+                    }
+                }
+            }
+            worst = worst.max(streamed);
+        }
+        let total = silhouettes + worst;
+        // 40 octets par sommet (position, normale, couleur) : < 400 Mo.
+        assert!(total < 10_000_000, "{total} sommets (silhouettes {silhouettes}, streaming {worst})");
+    }
+
+    #[test]
+    fn streaming_has_hysteresis() {
+        let reach = tree_lod_distances(TreeLod::Model).1 .1 + STREAM_MARGIN_M;
+        assert!(streamed_lod_wanted(TreeLod::Model, reach - 1.0, false));
+        assert!(!streamed_lod_wanted(TreeLod::Model, reach + 1.0, false));
+        // Déjà construit : on le garde un peu au-delà.
+        assert!(streamed_lod_wanted(TreeLod::Model, reach + 1.0, true));
+        assert!(!streamed_lod_wanted(TreeLod::Model, reach + STREAM_HYSTERESIS_M + 1.0, true));
+        assert!(streamed_lod_wanted(TreeLod::Silhouette, 1e9, false));
     }
 
     #[test]

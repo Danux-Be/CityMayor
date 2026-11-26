@@ -122,6 +122,7 @@ pub fn run() {
             follow_sky,
             adapt_fog,
             refresh_city,
+            stream_forest,
             (auto_screenshot, screenshot_on_key).chain(),
         )
             .chain(),
@@ -174,30 +175,24 @@ struct Handles {
     roads: Handle<Mesh>,
 }
 
-/// Les trois niveaux de détail des arbres, du plus proche au plus lointain.
-const TREE_LODS: [nature::TreeLod; 3] = [nature::TreeLod::Model, nature::TreeLod::Reduced, nature::TreeLod::Silhouette];
+/// Niveaux construits à la demande près de la caméra (`stream_forest`).
+const STREAMED_LODS: [nature::TreeLod; 2] = [nature::TreeLod::Model, nature::TreeLod::Reduced];
 
 /// Plage de visibilité (mètres caméra → origine de la cellule) d'un niveau.
 fn tree_lod_range(lod: nature::TreeLod) -> VisibilityRange {
-    let (start, end) = match lod {
-        nature::TreeLod::Model => (0.0..0.0, 260.0..420.0),
-        nature::TreeLod::Reduced => (260.0..420.0, 1_500.0..1_900.0),
-        nature::TreeLod::Silhouette => (1_500.0..1_900.0, 7_000.0..8_000.0),
-    };
-    VisibilityRange { start_margin: start, end_margin: end, use_aabb: false }
+    let ((s0, s1), (e0, e1)) = nature::tree_lod_distances(lod);
+    VisibilityRange { start_margin: s0..s1, end_margin: e0..e1, use_aabb: false }
 }
 
-fn spawn_tree_lod(
+fn spawn_tree_entity(
     commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
+    mesh: Handle<Mesh>,
     material: &Handle<StandardMaterial>,
-    chunk: nature::TreeChunk,
     lod: nature::TreeLod,
     origin: Vec3,
-) -> Handle<Mesh> {
-    let handle = meshes.add(tree_mesh(chunk));
+) -> Entity {
     let mut entity = commands.spawn((
-        Mesh3d(handle.clone()),
+        Mesh3d(mesh),
         MeshMaterial3d(material.clone()),
         Transform::from_translation(origin),
         tree_lod_range(lod),
@@ -206,25 +201,37 @@ fn spawn_tree_lod(
     if lod == nature::TreeLod::Silhouette {
         entity.insert(bevy::light::NotShadowCaster);
     }
-    handle
+    entity.id()
 }
 
-/// Forêt de la zone jouable, par cellule.
+/// Toutes les forêts (décor et ville), par cellule.
+///
+/// Les silhouettes existent en permanence ; le modèle complet et le modèle
+/// allégé sont construits quand la caméra s'approche et libérés quand elle
+/// s'éloigne (`nature::streamed_lod_wanted`). Construire le modèle complet
+/// partout saturait la mémoire.
 #[derive(Resource)]
-struct CityForest {
-    cells: Vec<CityForestCell>,
+struct Forest {
+    cells: Vec<ForestCell>,
     models: nature::TreeModels,
-    #[allow(dead_code)]
     material: Handle<StandardMaterial>,
 }
 
-struct CityForestCell {
-    spots: Vec<(nature::TreeSpot, sim_core::TileId)>,
+struct ForestCell {
+    /// Ville : chaque arbre garde sa tuile, pour céder la place aux bâtiments.
+    spots: Vec<(nature::TreeSpot, Option<sim_core::TileId>)>,
+    /// Arbres actuellement présents (décor : tous).
+    current: Vec<nature::TreeSpot>,
     origin: [f32; 3],
-    /// Un mesh par niveau de détail (ordre de `TREE_LODS`).
-    meshes: Vec<Handle<Mesh>>,
-    /// Arbres affichés : si le compte change, la cellule est reconstruite.
-    trees: usize,
+    silhouette: Handle<Mesh>,
+    /// Entité et mesh construits pour chaque niveau de `STREAMED_LODS`.
+    streamed: [Option<(Entity, Handle<Mesh>)>; 2],
+}
+
+impl ForestCell {
+    fn is_city(&self) -> bool {
+        self.spots.first().is_some_and(|(_, tile)| tile.is_some())
+    }
 }
 
 /// Caméra orbitale amortie et bornée.
@@ -425,36 +432,36 @@ fn setup(
         reflectance: 0.2,
         ..default()
     });
-    // Trois niveaux de détail superposés (modèle Blender, modèle décimé,
-    // silhouette), échangés en fondu selon la distance. `VisibilityRange`
-    // mesure depuis l'origine de l'entité : chaque cellule est recentrée sur
-    // ses arbres, identiquement pour les trois niveaux.
+    // Forêts : silhouettes permanentes ici ; modèle complet et allégé à la
+    // demande (`stream_forest`). Les trois niveaux d'une cellule partagent
+    // la même origine, pour des fondus (`VisibilityRange`) exacts.
     let models = nature::TreeModels::embedded();
+    let mut forest = Forest { cells: Vec::new(), models, material: tree_mat.clone() };
+    let mut cells: Vec<Vec<(nature::TreeSpot, Option<sim_core::TileId>)>> = Vec::new();
     if !disabled("arbres") {
-        for spots in nature::decor_tree_cells(world, 500.0) {
-            let origin = nature::spots_center(&spots);
-            for lod in TREE_LODS {
-                let chunk = nature::build_trees(&spots, lod, &models, origin);
-                spawn_tree_lod(&mut commands, &mut meshes, &tree_mat, chunk, lod, Vec3::from(origin));
-            }
-        }
+        cells.extend(
+            nature::decor_tree_cells(world, 500.0)
+                .into_iter()
+                .map(|c| c.into_iter().map(|s| (s, None)).collect()),
+        );
     }
-    // Forêt de la ville : placements calculés une fois, géométrie refaite par
-    // cellule quand la ville empiète dessus (`refresh_city`).
-    let cells = nature::play_area_tree_cells(world, 256.0);
-    let mut city_forest = CityForest { cells: Vec::new(), models, material: tree_mat.clone() };
-    for cell in cells {
-        let all: Vec<_> = cell.iter().map(|(spot, _)| *spot).collect();
+    cells.extend(
+        nature::play_area_tree_cells(world, 256.0)
+            .into_iter()
+            .map(|c| c.into_iter().map(|(s, t)| (s, Some(t))).collect()),
+    );
+    for spots in cells {
+        let all: Vec<_> = spots.iter().map(|(s, _)| *s).collect();
         let origin = nature::spots_center(&all);
-        let spots = nature::city_trees(world, &cell);
-        let mut handles = Vec::new();
-        for lod in TREE_LODS {
-            let chunk = nature::build_trees(&spots, lod, &city_forest.models, origin);
-            handles.push(spawn_tree_lod(&mut commands, &mut meshes, &tree_mat, chunk, lod, Vec3::from(origin)));
-        }
-        city_forest.cells.push(CityForestCell { spots: cell, origin, meshes: handles, trees: spots.len() });
+        let city = spots.first().is_some_and(|(_, t)| t.is_some());
+        let current = if city { city_spots(world, &spots) } else { all };
+        let chunk = nature::build_trees(&current, nature::TreeLod::Silhouette, &forest.models, origin);
+        // Ville : mesh modifiable (la ville empiète) ; décor : GPU seulement.
+        let silhouette = meshes.add(if city { tree_mesh(chunk) } else { static_tree_mesh(chunk) });
+        spawn_tree_entity(&mut commands, silhouette.clone(), &tree_mat, nature::TreeLod::Silhouette, Vec3::from(origin));
+        forest.cells.push(ForestCell { spots, current, origin, silhouette, streamed: [None, None] });
     }
-    commands.insert_resource(city_forest);
+    commands.insert_resource(forest);
 
     // --- la ville (reconstruite quand elle change)
     handles.buildings = meshes.add(buildings_mesh(&scene::buildings(world)));
@@ -687,12 +694,14 @@ fn follow_sky(
 /// Reconstruit la géométrie de la ville quand elle change, au plus deux fois
 /// par seconde : pendant la croissance, la signature change presque à chaque
 /// tick, et tout refaire à chaque image coûtait ~25 ms (mesuré).
+#[allow(clippy::too_many_arguments)] // système Bevy : chaque ressource est un paramètre
 fn refresh_city(
     sim: Res<Sim>,
     time: Res<Time>,
     mut meshes: ResMut<Assets<Mesh>>,
     handles: Res<Handles>,
-    mut forest: ResMut<CityForest>,
+    mut forest: ResMut<Forest>,
+    mut commands: Commands,
     mut built_signature: Local<Option<(u32, u32, u32)>>,
     mut since_last: Local<f32>,
 ) {
@@ -710,20 +719,91 @@ fn refresh_city(
     if let Some(mut mesh) = meshes.get_mut(&handles.roads) {
         *mesh = roads_mesh(&scene::roads(world));
     }
-    // Forêt : seules les cellules dont le nombre d'arbres a changé.
+    // Forêt : seules les cellules de la ville dont les arbres ont changé. Les
+    // niveaux streamés sont libérés ; `stream_forest` les reconstruit.
     let forest = &mut *forest;
-    for cell in &mut forest.cells {
-        let spots = nature::city_trees(world, &cell.spots);
-        if spots.len() == cell.trees {
+    for cell in forest.cells.iter_mut().filter(|c| c.is_city()) {
+        let spots = city_spots(world, &cell.spots);
+        if spots.len() == cell.current.len() {
             continue;
         }
-        cell.trees = spots.len();
-        for (lod, handle) in TREE_LODS.iter().zip(&cell.meshes) {
-            if let Some(mut mesh) = meshes.get_mut(handle) {
-                *mesh = tree_mesh(nature::build_trees(&spots, *lod, &forest.models, cell.origin));
+        cell.current = spots;
+        if let Some(mut mesh) = meshes.get_mut(&cell.silhouette) {
+            *mesh = tree_mesh(nature::build_trees(&cell.current, nature::TreeLod::Silhouette, &forest.models, cell.origin));
+        }
+        for slot in &mut cell.streamed {
+            if let Some((entity, handle)) = slot.take() {
+                commands.entity(entity).despawn();
+                meshes.remove(&handle);
             }
         }
     }
+}
+
+/// Arbres d'une cellule de la ville qui ont encore leur place.
+fn city_spots(world: &World, spots: &[(nature::TreeSpot, Option<sim_core::TileId>)]) -> Vec<nature::TreeSpot> {
+    let with_tiles: Vec<_> = spots.iter().filter_map(|(s, t)| t.map(|t| (*s, t))).collect();
+    nature::city_trees(world, &with_tiles)
+}
+
+/// Construit/libère le modèle complet et le modèle allégé des cellules selon
+/// la distance à la caméra, avec un budget d'arbres par passage pour ne pas
+/// figer l'image quand la caméra saute.
+fn stream_forest(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut forest: ResMut<Forest>,
+    cameras: Query<&Transform, With<Camera3d>>,
+    time: Res<Time>,
+    mut since_last: Local<f32>,
+    mut warm: Local<bool>,
+) {
+    *since_last += time.delta_secs();
+    if *warm && *since_last < 0.2 {
+        return;
+    }
+    *since_last = 0.0;
+    let Ok(camera) = cameras.single() else {
+        return;
+    };
+    let eye = camera.translation;
+    // Premier passage sans limite : l'image initiale est complète.
+    let mut budget: usize = if *warm { 40_000 } else { usize::MAX };
+    *warm = true;
+    let forest = &mut *forest;
+    let mut order: Vec<(f32, usize)> = forest
+        .cells
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (eye.distance(Vec3::from(c.origin)), i))
+        .collect();
+    // Les plus proches d'abord : c'est là qu'un manque se verrait.
+    order.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (distance, index) in order {
+        let cell = &mut forest.cells[index];
+        for (slot, lod) in STREAMED_LODS.iter().enumerate() {
+            let built = cell.streamed[slot].is_some();
+            let wanted = nature::streamed_lod_wanted(*lod, distance, built);
+            if wanted && !built && budget >= cell.current.len() {
+                budget -= cell.current.len();
+                let chunk = nature::build_trees(&cell.current, *lod, &forest.models, cell.origin);
+                let handle = meshes.add(static_tree_mesh(chunk));
+                let entity = spawn_tree_entity(&mut commands, handle.clone(), &forest.material, *lod, Vec3::from(cell.origin));
+                cell.streamed[slot] = Some((entity, handle));
+            } else if !wanted && built {
+                if let Some((entity, handle)) = cell.streamed[slot].take() {
+                    commands.entity(entity).despawn();
+                    meshes.remove(&handle);
+                }
+            }
+        }
+    }
+}
+
+/// Mesh d'arbres qui ne changera plus : seule la copie GPU est gardée (la
+/// copie CPU du monde principal est libérée après téléversement).
+fn static_tree_mesh(chunk: nature::TreeChunk) -> Mesh {
+    mesh(chunk.positions, chunk.normals, Some(chunk.colors), None, chunk.indices, RenderAssetUsages::RENDER_WORLD)
 }
 
 fn tree_mesh(chunk: nature::TreeChunk) -> Mesh {
