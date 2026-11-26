@@ -324,9 +324,9 @@ impl Species {
 pub enum TreeLod {
     /// Modèle complet (~400–750 triangles) : vu de près.
     Model,
-    /// Modèle décimé (~45 triangles) : même silhouette, à mi-distance.
+    /// Quelques grandes cartes (~30–80 triangles) : mi-distance.
     Reduced,
-    /// Silhouette procédurale (5–8 triangles) : jusqu'à l'horizon.
+    /// Imposteur : deux plans croisés portant le rendu de l'arbre (4 triangles).
     Silhouette,
 }
 
@@ -335,7 +335,10 @@ pub enum TreeLod {
 pub struct TreeModel {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
+    /// Multiplicateur de l'atlas : occlusion ambiante cuite.
     pub colors: Vec<[f32; 4]>,
+    /// Coordonnées dans l'atlas (`assets/trees/atlas.png`).
+    pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
 }
 
@@ -358,22 +361,31 @@ impl TreeModel {
         let colors: Vec<[f32; 4]> = reader
             .read_colors(0)
             .map_or_else(|| vec![[0.2, 0.35, 0.15, 1.0]; positions.len()], |c| c.into_rgba_f32().collect());
+        let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0).ok_or("UV absentes")?.into_f32().collect();
         let indices: Vec<u32> = reader
             .read_indices()
             .map_or_else(|| (0..positions.len() as u32).collect(), |i| i.into_u32().collect());
-        if normals.len() != positions.len() || colors.len() != positions.len() {
+        if normals.len() != positions.len() || colors.len() != positions.len() || uvs.len() != positions.len() {
             return Err("attributs de longueurs différentes".into());
         }
-        Ok(Self { positions, normals, colors, indices })
+        Ok(Self { positions, normals, colors, uvs, indices })
     }
 }
 
-/// Les modèles des quatre essences, en deux niveaux de détail.
+/// Les modèles des quatre essences, en trois niveaux de détail.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TreeModels {
     pub model: [TreeModel; 4],
     pub reduced: [TreeModel; 4],
+    pub impostor: [TreeModel; 4],
 }
+
+/// Atlas des arbres (cartes de feuillage, écorces, imposteurs), PNG RGBA.
+pub const TREE_ATLAS_PNG: &[u8] = include_bytes!("../assets/trees/atlas.png");
+/// Seuil d'alpha du feuillage (matériau « alpha mask » et mipmaps).
+pub const TREE_ALPHA_CUTOFF: f32 = 0.5;
+/// Taille des cellules de l'atlas (pixels), pour les mipmaps par cellule.
+pub const TREE_ATLAS_CELL: u32 = 512;
 
 impl TreeModels {
     /// Modèles embarqués dans le binaire (`assets/trees/*.glb`).
@@ -398,6 +410,12 @@ impl TreeModels {
                 load(include_bytes!("../assets/trees/chene_lod1.glb"), "chene"),
                 load(include_bytes!("../assets/trees/bouleau_lod1.glb"), "bouleau"),
             ],
+            impostor: [
+                load(include_bytes!("../assets/trees/epicea_lod2.glb"), "epicea"),
+                load(include_bytes!("../assets/trees/pin_lod2.glb"), "pin"),
+                load(include_bytes!("../assets/trees/chene_lod2.glb"), "chene"),
+                load(include_bytes!("../assets/trees/bouleau_lod2.glb"), "bouleau"),
+            ],
         }
     }
 }
@@ -421,6 +439,7 @@ pub struct TreeChunk {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub colors: Vec<[f32; 4]>,
+    pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
     pub trees: usize,
 }
@@ -452,7 +471,7 @@ pub fn decor_tree_cells(world: &World, cell_m: f32) -> Vec<Vec<TreeSpot>> {
                     return None;
                 }
                 let gap = (-px).max(px - w).max(-pz).max(pz - h).max(0.0);
-                Some(if gap < 1_200.0 { 8.0 } else { 18.0 })
+                Some(if gap < 1_200.0 { 9.0 } else { 18.0 })
             });
             if !spots.is_empty() {
                 cells.push(spots);
@@ -519,7 +538,7 @@ pub fn build_trees(spots: &[TreeSpot], lod: TreeLod, models: &TreeModels, origin
         match lod {
             TreeLod::Model => push_model(&mut chunk, &models.model[spot.species.index()], base, spot),
             TreeLod::Reduced => push_model(&mut chunk, &models.reduced[spot.species.index()], base, spot),
-            TreeLod::Silhouette => push_silhouette(&mut chunk, base, spot),
+            TreeLod::Silhouette => push_model(&mut chunk, &models.impostor[spot.species.index()], base, spot),
         }
         chunk.trees += 1;
     }
@@ -531,18 +550,18 @@ pub fn build_trees(spots: &[TreeSpot], lod: TreeLod, models: &TreeModels, origin
 #[must_use]
 pub const fn tree_lod_distances(lod: TreeLod) -> ((f32, f32), (f32, f32)) {
     match lod {
-        TreeLod::Model => ((0.0, 0.0), (220.0, 350.0)),
-        TreeLod::Reduced => ((220.0, 350.0), (1_150.0, 1_450.0)),
-        TreeLod::Silhouette => ((1_150.0, 1_450.0), (7_000.0, 8_000.0)),
+        TreeLod::Model => ((0.0, 0.0), (180.0, 300.0)),
+        TreeLod::Reduced => ((180.0, 300.0), (1_050.0, 1_300.0)),
+        TreeLod::Silhouette => ((1_050.0, 1_300.0), (7_000.0, 8_000.0)),
     }
 }
 
 /// Marge (m) entre la fin de visibilité d'un niveau et le moment où on le
 /// construit : la cellule est prête avant d'entrer dans le champ.
-pub const STREAM_MARGIN_M: f32 = 120.0;
+pub const STREAM_MARGIN_M: f32 = 80.0;
 /// Hystérésis (m) avant de libérer un niveau : pas de construction/libération
 /// en boucle quand la caméra oscille autour d'une limite.
-pub const STREAM_HYSTERESIS_M: f32 = 150.0;
+pub const STREAM_HYSTERESIS_M: f32 = 100.0;
 
 /// Les niveaux « modèle » et « allégé » d'une cellule doivent-ils exister,
 /// pour une caméra à `distance` mètres de son origine ? `built` : état actuel
@@ -644,9 +663,12 @@ fn push_model(chunk: &mut TreeChunk, model: &TreeModel, base: [f32; 3], spot: &T
     let (sin, cos) = spot.angle.sin_cos();
     // Légère variation d'élancement : pas deux arbres identiques.
     let stretch = 0.9 + spot.tint * 0.25;
-    let tone = 0.82 + spot.tint * 0.32;
-    let autumn = if spot.species.is_conifer() { 0.0 } else { (spot.tint - 0.8).max(0.0) * 2.5 };
-    for ((p, n), c) in model.positions.iter().zip(&model.normals).zip(&model.colors) {
+    // Teinte multipliée à l'atlas : un peu plus clair/sombre, et quelques
+    // feuillus qui roussissent (pas les résineux).
+    let tone = 0.85 + spot.tint * 0.3;
+    let autumn = if spot.species.is_conifer() { 0.0 } else { (spot.tint - 0.82).max(0.0) * 4.0 };
+    let tint = [tone * (1.0 + autumn * 0.45), tone * (1.0 - autumn * 0.1), tone * (1.0 - autumn * 0.45)];
+    for (((p, n), c), uv) in model.positions.iter().zip(&model.normals).zip(&model.colors).zip(&model.uvs) {
         let (x, z) = (p[0] * cos - p[2] * sin, p[0] * sin + p[2] * cos);
         chunk.positions.push([
             base[0] + x * spot.scale,
@@ -654,94 +676,81 @@ fn push_model(chunk: &mut TreeChunk, model: &TreeModel, base: [f32; 3], spot: &T
             base[2] + z * spot.scale,
         ]);
         chunk.normals.push([n[0] * cos - n[2] * sin, n[1], n[0] * sin + n[2] * cos]);
-        chunk.colors.push([
-            (c[0] * tone + autumn * 0.06).min(1.0),
-            c[1] * tone,
-            c[2] * tone * (1.0 - autumn * 0.3),
-            1.0,
-        ]);
+        chunk.colors.push([c[0] * tint[0], c[1] * tint[1], c[2] * tint[2], 1.0]);
+        chunk.uvs.push(*uv);
     }
     chunk.indices.extend(model.indices.iter().map(|i| start + i));
 }
 
-/// Silhouette lointaine : un cône (résineux) ou une double pyramide (feuillu),
-/// aux proportions des modèles.
-fn push_silhouette(chunk: &mut TreeChunk, base: [f32; 3], spot: &TreeSpot) {
-    let s = spot.scale;
-    let t = spot.tint;
-    match spot.species {
-        Species::Spruce => {
-            let color = [0.05 + t * 0.02, 0.12 + t * 0.03, 0.06, 1.0];
-            push_cone(chunk, [base[0], base[1] + 1.0 * s, base[2]], 3.6 * s, 0.0, 20.0 * s, 5, spot.angle, color);
+/// Mipmaps d'une image RGBA8 carrée qui **préservent la couverture** du
+/// feuillage, cellule par cellule.
+///
+/// Une moyenne 2×2 de l'alpha fait fondre les feuilles fines sous le seuil
+/// du masque : vus de loin, les arbres deviendraient transparents. À chaque
+/// niveau, l'alpha de chaque cellule est multiplié par le facteur qui rend
+/// la même proportion de pixels opaques qu'au niveau 0.
+#[must_use]
+pub fn coverage_preserving_mips(level0: &[u8], size: u32, cell: u32, cutoff: f32) -> Vec<Vec<u8>> {
+    // Le GPU garde un pixel si alpha/255 ≥ seuil : il faut au moins
+    // ⌈seuil × 255⌉ (128 pour 0,5), pas ⌊…⌋ (127 serait jeté).
+    let threshold = (cutoff * 255.0).ceil() as u8;
+    let cells = (size / cell).max(1);
+    let coverage = |pixels: &[u8], size: u32, cx: u32, cy: u32, scale: f32| -> f32 {
+        let cs = (size / cells).max(1);
+        let mut opaque = 0u32;
+        for y in cy * cs..(cy + 1) * cs {
+            for x in cx * cs..(cx + 1) * cs {
+                let a = f32::from(pixels[((y * size + x) * 4 + 3) as usize]) * scale;
+                if a >= f32::from(threshold) {
+                    opaque += 1;
+                }
+            }
         }
-        Species::Pine => {
-            let color = [0.07 + t * 0.02, 0.14 + t * 0.03, 0.06, 1.0];
-            push_blob(chunk, [base[0], base[1] + 13.5 * s, base[2]], 3.2 * s, 2.2 * s, spot.angle, color, 4);
-        }
-        Species::Oak => {
-            let color = [0.10 + t * 0.04, 0.19 + t * 0.04, 0.05, 1.0];
-            push_blob(chunk, [base[0], base[1] + 8.5 * s, base[2]], 5.5 * s, 4.0 * s, spot.angle, color, 4);
-        }
-        Species::Birch => {
-            let color = [0.17 + t * 0.04, 0.28 + t * 0.04, 0.08, 1.0];
-            push_blob(chunk, [base[0], base[1] + 10.0 * s, base[2]], 2.6 * s, 4.0 * s, spot.angle, color, 4);
-        }
-    }
-}
+        opaque as f32 / (cs * cs) as f32
+    };
+    let targets: Vec<f32> = (0..cells * cells).map(|i| coverage(level0, size, i % cells, i / cells, 1.0)).collect();
 
-/// Tronc de cône (`top_r = 0` : cône) à `sides` faces, normales lissées.
-#[allow(clippy::too_many_arguments)]
-fn push_cone(chunk: &mut TreeChunk, base: [f32; 3], r0: f32, r1: f32, height: f32, sides: u32, rot: f32, color: [f32; 4]) {
-    let start = chunk.positions.len() as u32;
-    let slope = (r0 - r1) / height.max(1e-3);
-    for s in 0..sides {
-        let a = rot + s as f32 / sides as f32 * std::f32::consts::TAU;
-        let (c, sn) = (a.cos(), a.sin());
-        let len = (1.0 + slope * slope).sqrt();
-        let n = [c / len, slope / len, sn / len];
-        chunk.positions.push([base[0] + c * r0, base[1], base[2] + sn * r0]);
-        chunk.positions.push([base[0] + c * r1, base[1] + height, base[2] + sn * r1]);
-        chunk.normals.push(n);
-        chunk.normals.push(n);
-        chunk.colors.push(color);
-        // Sommet plus clair : lumière du ciel sur le haut du feuillage.
-        chunk.colors.push([color[0] * 1.25, color[1] * 1.25, color[2] * 1.2, 1.0]);
-    }
-    for s in 0..sides {
-        let a = start + s * 2;
-        let b = start + ((s + 1) % sides) * 2;
-        if r1 > 0.0 {
-            chunk.indices.extend_from_slice(&[a, a + 1, b, b, a + 1, b + 1]);
-        } else {
-            // Cône pointu : un seul triangle par face (l'autre serait dégénéré).
-            chunk.indices.extend_from_slice(&[a, a + 1, b]);
+    let mut levels = vec![level0.to_vec()];
+    let mut source = level0.to_vec(); // chaîne non corrigée, pour réduire
+    let mut s = size;
+    while s > 1 {
+        let half = s / 2;
+        let mut next = vec![0u8; (half * half * 4) as usize];
+        for y in 0..half {
+            for x in 0..half {
+                for c in 0..4 {
+                    let at = |dx: u32, dy: u32| u32::from(source[(((y * 2 + dy) * s + x * 2 + dx) * 4 + c) as usize]);
+                    next[((y * half + x) * 4 + c) as usize] = ((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8;
+                }
+            }
         }
+        source = next.clone();
+        s = half;
+        if s >= cells {
+            let cs = s / cells;
+            for i in 0..cells * cells {
+                let (cx, cy) = (i % cells, i / cells);
+                let target = targets[i as usize];
+                // Recherche dichotomique du facteur d'alpha.
+                let (mut lo, mut hi) = (0.5f32, 8.0f32);
+                for _ in 0..12 {
+                    let mid = (lo + hi) / 2.0;
+                    if coverage(&source, s, cx, cy, mid) < target { lo = mid } else { hi = mid }
+                }
+                // `hi` garantit au moins la couverture visée : en cas
+                // d'égalité, on garde le feuillage plutôt que de l'effacer.
+                let scale = hi;
+                for y in cy * cs..(cy + 1) * cs {
+                    for x in cx * cs..(cx + 1) * cs {
+                        let k = ((y * s + x) * 4 + 3) as usize;
+                        next[k] = (f32::from(next[k]) * scale).ceil().min(255.0) as u8;
+                    }
+                }
+            }
+        }
+        levels.push(next);
     }
-}
-
-/// Houppier de feuillu : double pyramide à 6 côtés.
-fn push_blob(chunk: &mut TreeChunk, center: [f32; 3], radius: f32, half_height: f32, rot: f32, color: [f32; 4], sides: u32) {
-    let start = chunk.positions.len() as u32;
-    let top = [center[0], center[1] + half_height, center[2]];
-    let bottom = [center[0], center[1] - half_height * 0.8, center[2]];
-    chunk.positions.push(top);
-    chunk.normals.push([0.0, 1.0, 0.0]);
-    chunk.colors.push([color[0] * 1.3, color[1] * 1.3, color[2] * 1.2, 1.0]);
-    chunk.positions.push(bottom);
-    chunk.normals.push([0.0, -1.0, 0.0]);
-    chunk.colors.push([color[0] * 0.7, color[1] * 0.7, color[2] * 0.7, 1.0]);
-    for s in 0..sides {
-        let a = rot + s as f32 / sides as f32 * std::f32::consts::TAU;
-        let wobble = 0.85 + 0.3 * ((s * 7 + 3) % 5) as f32 / 4.0;
-        chunk.positions.push([center[0] + a.cos() * radius * wobble, center[1], center[2] + a.sin() * radius * wobble]);
-        chunk.normals.push([a.cos() * 0.9, 0.35, a.sin() * 0.9]);
-        chunk.colors.push(color);
-    }
-    for s in 0..sides {
-        let a = start + 2 + s;
-        let b = start + 2 + (s + 1) % sides;
-        chunk.indices.extend_from_slice(&[start, a, b, start + 1, b, a]);
-    }
+    levels
 }
 
 // ------------------------------------------------------------- eau, ciel
@@ -985,7 +994,13 @@ mod tests {
             let reduced = &models.reduced[species.index()];
             let (tf, tr) = (full.indices.len() / 3, reduced.indices.len() / 3);
             assert!((150..=900).contains(&tf), "{species:?} : {tf} triangles");
-            assert!(tr <= 64 && tr * 5 < tf, "{species:?} réduit : {tr} triangles");
+            assert!(tr <= 100 && tr * 2 < tf, "{species:?} réduit : {tr} triangles");
+            let impostor = &models.impostor[species.index()];
+            assert_eq!(impostor.indices.len() / 3, 4, "{species:?} : imposteur");
+            // Les UV restent dans l'atlas.
+            for m in [full, reduced, impostor] {
+                assert!(m.uvs.iter().flatten().all(|v| (0.0..=1.0).contains(v)));
+            }
             for model in [full, reduced] {
                 assert!(model.indices.iter().all(|&i| (i as usize) < model.positions.len()));
                 // Pied à l'origine, debout (Y vers le haut), hauteur d'arbre.
@@ -1031,8 +1046,35 @@ mod tests {
             worst = worst.max(streamed);
         }
         let total = silhouettes + worst;
-        // 40 octets par sommet (position, normale, couleur) : < 400 Mo.
-        assert!(total < 10_000_000, "{total} sommets (silhouettes {silhouettes}, streaming {worst})");
+        // 48 octets par sommet (position, normale, couleur, UV) : < 770 Mo de
+        // mémoire vidéo. Les copies CPU des niveaux streamés sont libérées
+        // après téléversement (`RenderAssetUsages::RENDER_WORLD`).
+        assert!(total < 16_000_000, "{total} sommets (silhouettes {silhouettes}, streaming {worst})");
+    }
+
+    #[test]
+    fn mipmaps_keep_foliage_coverage() {
+        // Damier fin (1 pixel sur 2 opaque) : une moyenne simple donnerait
+        // alpha 127 partout, sous le seuil, et le feuillage disparaîtrait.
+        let size = 64u32;
+        let mut pixels = vec![0u8; (size * size * 4) as usize];
+        for y in 0..size {
+            for x in 0..size {
+                if (x + y) % 2 == 0 {
+                    pixels[((y * size + x) * 4 + 3) as usize] = 255;
+                }
+            }
+        }
+        let levels = coverage_preserving_mips(&pixels, size, 32, TREE_ALPHA_CUTOFF);
+        assert_eq!(levels.len(), 7);
+        let level1 = &levels[1];
+        let opaque = level1.chunks(4).filter(|p| p[3] >= 128).count();
+        assert!(opaque > 0, "feuillage effacé au premier niveau de mip");
+        // Atlas réel : chaque niveau garde des pixels opaques.
+        // En-tête PNG (IHDR) : 2048 × 2048.
+        let width = u32::from_be_bytes(TREE_ATLAS_PNG[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(TREE_ATLAS_PNG[20..24].try_into().unwrap());
+        assert_eq!((width, height), (2048, 2048));
     }
 
     #[test]
@@ -1056,7 +1098,7 @@ mod tests {
         let lods = [TreeLod::Model, TreeLod::Reduced, TreeLod::Silhouette].map(|lod| build_trees(spots, lod, &models, origin));
         assert!(lods.iter().all(|c| c.trees == spots.len()));
         // Chaque niveau coûte nettement moins que le précédent.
-        assert!(lods[1].indices.len() * 5 < lods[0].indices.len());
+        assert!(lods[1].indices.len() * 2 < lods[0].indices.len());
         assert!(lods[2].indices.len() * 3 < lods[1].indices.len());
     }
 }

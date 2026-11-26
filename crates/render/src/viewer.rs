@@ -345,6 +345,52 @@ fn terrain_layers() -> Image {
     }
 }
 
+/// Atlas des arbres avec mipmaps qui préservent la couverture du feuillage
+/// (`nature::coverage_preserving_mips`) : sans elles, les arbres lointains
+/// deviendraient transparents.
+fn tree_atlas() -> Image {
+    let decoded = Image::from_buffer(
+        nature::TREE_ATLAS_PNG,
+        ImageType::Extension("png"),
+        CompressedImageFormats::NONE,
+        true,
+        ImageSampler::Default,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+    .expect("atlas des arbres illisible");
+    let size = decoded.width();
+    let rgba = decoded.convert(TextureFormat::Rgba8UnormSrgb).expect("conversion RGBA8");
+    let levels = nature::coverage_preserving_mips(
+        rgba.data.as_deref().expect("pixels"),
+        size,
+        nature::TREE_ATLAS_CELL,
+        nature::TREE_ALPHA_CUTOFF,
+    );
+    let mip_level_count = levels.len() as u32;
+    Image {
+        data: Some(levels.concat()),
+        texture_descriptor: TextureDescriptor {
+            label: Some("tree_atlas"),
+            size: Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            mip_level_count,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        sampler: ImageSampler::Descriptor(ImageSamplerDescriptor {
+            mag_filter: ImageFilterMode::Linear,
+            min_filter: ImageFilterMode::Linear,
+            mipmap_filter: ImageFilterMode::Linear,
+            anisotropy_clamp: 8,
+            ..default()
+        }),
+        asset_usage: RenderAssetUsages::RENDER_WORLD,
+        ..default()
+    }
+}
+
 /// Réduction 2×2 (boîte) d'une image RGBA8 carrée.
 fn downsample(pixels: &[u8], size: u32) -> Vec<u8> {
     let half = (size / 2).max(1);
@@ -426,9 +472,16 @@ fn setup(
     }
 
     // --- forêts du décor (une entité par cellule de 1 km : culling)
+    // Arbres : un seul matériau, l'atlas (cartes de feuillage, écorces,
+    // imposteurs) détouré par son alpha. Pas de « double_sided » : les deux
+    // faces d'une carte gardent la même normale de canopée.
     let tree_mat = materials.add(StandardMaterial {
         base_color: Color::WHITE,
-        perceptual_roughness: 0.95,
+        base_color_texture: Some(images.add(tree_atlas())),
+        alpha_mode: AlphaMode::Mask(nature::TREE_ALPHA_CUTOFF),
+        cull_mode: None,
+        double_sided: false,
+        perceptual_roughness: 0.85,
         reflectance: 0.2,
         ..default()
     });
@@ -803,7 +856,7 @@ fn stream_forest(
 /// Mesh d'arbres qui ne changera plus : seule la copie GPU est gardée (la
 /// copie CPU du monde principal est libérée après téléversement).
 fn static_tree_mesh(chunk: nature::TreeChunk) -> Mesh {
-    mesh(chunk.positions, chunk.normals, Some(chunk.colors), None, chunk.indices, RenderAssetUsages::RENDER_WORLD)
+    mesh(chunk.positions, chunk.normals, Some(chunk.colors), Some(chunk.uvs), chunk.indices, RenderAssetUsages::RENDER_WORLD)
 }
 
 fn tree_mesh(chunk: nature::TreeChunk) -> Mesh {
@@ -811,7 +864,7 @@ fn tree_mesh(chunk: nature::TreeChunk) -> Mesh {
         chunk.positions,
         chunk.normals,
         Some(chunk.colors),
-        None,
+        Some(chunk.uvs),
         chunk.indices,
         RenderAssetUsages::default(),
     )
