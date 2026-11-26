@@ -28,7 +28,9 @@
 //! - **Overlays** : un seul shader de surface, un sampler de la couche choisie
 //!   (`World::overlay_cell`), donc zéro duplication de géométrie.
 
+pub mod nature;
 pub mod scene;
+pub mod urban;
 
 #[cfg(feature = "viewer")]
 pub mod viewer;

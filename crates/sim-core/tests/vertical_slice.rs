@@ -574,3 +574,28 @@ fn saturated_city_keeps_aggregates_consistent() {
     run(&mut world, 200);
     assert_eq!(world.buildings().live_count(), built);
 }
+
+#[test]
+fn generated_world_grows_on_dry_land_only() {
+    use sim_core::WorldGenParams;
+    let mut world = World::generated(SimConfig::default(), 3, WorldGenParams::default(), 96, 96);
+    assert!(world.worldgen().is_some());
+    // Une avenue en travers de la carte, zonage résidentiel/commercial/industriel.
+    world.queue(Command::BuildRoad {
+        from: p(2, 48),
+        to: p(93, 48),
+        spec: RoadSpec::AVENUE,
+    });
+    for (row, zone) in [(49, ZoneType::Residential), (50, ZoneType::Residential), (47, ZoneType::Commercial), (46, ZoneType::Industrial)] {
+        world.queue(Command::ZoneRect {
+            rect: Rect::new(2, row, 93, row),
+            zone,
+        });
+    }
+    run(&mut world, 1_500);
+    assert!(world.buildings().live_count() > 0);
+    for (_, building) in world.buildings().iter() {
+        let altitude = world.terrain().altitude_cm(building.tile).unwrap();
+        assert!(altitude > sim_core::terrain::WATER_LEVEL_CM, "bâtiment dans l'eau");
+    }
+}

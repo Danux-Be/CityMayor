@@ -19,58 +19,111 @@
 //!   (`Point { x, y }` = plan du sol) : la conversion se fait ici, une fois.
 
 use sim_core::{
-    tile_center_m, BuildingKind, Command, Fixed, Point, Rect, RoadSpec, SimConfig, Terrain,
-    World, ZoneType,
+    tile_center_m, BuildingKind, Command, Fixed, Point, Rect, RoadSpec, SimConfig, World,
+    WorldGenParams, ZoneType,
 };
+#[cfg(test)]
+use sim_core::Terrain;
 
-/// Construit un monde de démonstration : un maillage d'avenues, un boulevard
-/// courbe pour montrer les splines, et un zonage mixte qui produit une ville
-/// lisible en quelques secondes. Vit ici (sans Bevy) pour être testé.
+/// Taille de la carte de démonstration (tuiles de 8 m → 2 048 m de côté,
+/// l'ordre de grandeur d'une case de *Cities: Skylines*).
+pub const DEMO_MAP_TILES: u32 = 256;
+
+/// Construit un monde de démonstration sur un relief généré (collines,
+/// fleuve, lacs, montagnes à l'horizon) : des avenues tracées seulement sur la
+/// terre ferme, de part et d'autre du fleuve, un boulevard courbe et un
+/// zonage mixte. Vit ici (sans Bevy) pour être testé.
 #[must_use]
 pub fn demo_city() -> World {
-    let mut world = World::new(SimConfig::default(), 0x0C17_CAFE, Terrain::flat(128, 128));
-    for row in 0..10i32 {
-        let y = 16 + row * 10;
-        world.queue(Command::BuildRoad {
-            from: Point::new(tile_center_m(8), tile_center_m(y)),
-            to: Point::new(tile_center_m(120), tile_center_m(y)),
-            spec: RoadSpec::AVENUE,
-        });
-        for (band, zone) in [
-            (y + 1, ZoneType::Residential),
-            (y + 2, ZoneType::Residential),
-            (y + 3, ZoneType::Residential),
-            (y - 1, ZoneType::Commercial),
-            (y - 2, ZoneType::Industrial),
-            (y - 3, ZoneType::Industrial),
-        ] {
-            world.queue(Command::ZoneRect {
-                rect: Rect::new(8, band as u32, 120, band as u32),
-                zone,
+    // Rayon d'accès de 3 tuiles : le premier rang de zonage est à deux tuiles
+    // de l'axe de l'avenue (14 m de chaussée + trottoirs), la tuile entre
+    // les deux sert d'accotement et de jardin de devant.
+    let config = SimConfig { road_access_radius_tiles: 3, ..SimConfig::default() };
+    let mut world = World::generated(
+        config,
+        0x0C17_CAFE,
+        WorldGenParams::default(),
+        DEMO_MAP_TILES,
+        DEMO_MAP_TILES,
+    );
+    let max_slope = world.config().max_slope_cm;
+    let dry = |world: &World, x: u32, y: u32| -> bool {
+        world
+            .zoning()
+            .grid()
+            .tile_at(x, y)
+            .is_some_and(|tile| world.terrain().is_buildable(tile, max_slope))
+    };
+
+    let mut west_ends = Vec::new();
+    for row in 0..21u32 {
+        let y = 24 + row * 10;
+        // Tronçons secs d'au moins 16 tuiles : le fleuve coupe une avenue en
+        // deux tronçons (pas encore de ponts).
+        let mut runs = Vec::new();
+        let mut start = None;
+        for x in 6..DEMO_MAP_TILES - 6 {
+            match (dry(&world, x, y), start) {
+                (true, None) => start = Some(x),
+                (false, Some(s)) => {
+                    runs.push((s, x - 1));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            runs.push((s, DEMO_MAP_TILES - 7));
+        }
+        for (x0, x1) in runs.into_iter().filter(|(a, b)| b - a >= 16) {
+            let (x0, x1) = (x0 + 1, x1 - 1);
+            world.queue(Command::BuildRoad {
+                from: Point::new(tile_center_m(x0 as i32), tile_center_m(y as i32)),
+                to: Point::new(tile_center_m(x1 as i32), tile_center_m(y as i32)),
+                spec: RoadSpec::AVENUE,
+            });
+            if x0 < 40 {
+                west_ends.push((x0, y));
+            }
+            for (band, zone) in [
+                (y + 2, ZoneType::Residential),
+                (y + 3, ZoneType::Residential),
+                (y - 2, ZoneType::Commercial),
+                (y - 3, ZoneType::Industrial),
+            ] {
+                world.queue(Command::ZoneRect {
+                    rect: Rect::new(x0, band, x1, band),
+                    zone,
+                });
+            }
+        }
+    }
+
+    // Boulevard courbe entre l'extrémité ouest de deux avenues. Ces nœuds
+    // existent déjà (poignée nulle) et une poignée n'est appliquée qu'à un nœud
+    // *créé* par la commande (invariant 11) : un seul segment serait une
+    // droite. On passe par un nœud intermédiaire neuf, porteur de la tangente :
+    // les deux demi-segments sont courbes et partagent cette tangente (G1).
+    if let (Some(&(ax, ay)), Some(&(bx, by))) = (west_ends.first(), west_ends.get(4)) {
+        let (mx, my) = ((ax + bx) / 2 + 30, (ay + by) / 2);
+        if dry(&world, mx, my) {
+            let middle = Point::new(tile_center_m(mx as i32), tile_center_m(my as i32));
+            world.queue(Command::BuildCurve {
+                from: Point::new(tile_center_m(ax as i32), tile_center_m(ay as i32)),
+                to: middle,
+                from_handle: Point::default(),
+                to_handle: Point::new(Fixed::ZERO, Fixed::from_int(110)),
+                spec: RoadSpec::TWO_WAY,
+            });
+            world.queue(Command::BuildCurve {
+                from: middle,
+                to: Point::new(tile_center_m(bx as i32), tile_center_m(by as i32)),
+                from_handle: Point::default(),
+                to_handle: Point::default(),
+                spec: RoadSpec::TWO_WAY,
             });
         }
     }
-    // Boulevard courbe entre l'extrémité ouest de la première et de la dernière
-    // avenue. Ces deux nœuds existent déjà (poignée nulle) et une poignée n'est
-    // appliquée qu'à un nœud *créé* par la commande (invariant 11) : un seul
-    // segment entre eux serait donc une droite. On passe par un nœud
-    // intermédiaire neuf, porteur de la tangente : les deux demi-segments sont
-    // courbes et partagent cette tangente (G1 au milieu).
-    let middle = Point::new(tile_center_m(44), tile_center_m(61));
-    world.queue(Command::BuildCurve {
-        from: Point::new(tile_center_m(8), tile_center_m(16)),
-        to: middle,
-        from_handle: Point::default(),
-        to_handle: Point::new(Fixed::ZERO, Fixed::from_int(160)),
-        spec: RoadSpec::TWO_WAY,
-    });
-    world.queue(Command::BuildCurve {
-        from: middle,
-        to: Point::new(tile_center_m(8), tile_center_m(106)),
-        from_handle: Point::default(),
-        to_handle: Point::default(),
-        spec: RoadSpec::TWO_WAY,
-    });
     world
 }
 
@@ -99,6 +152,10 @@ pub struct RoadStrip {
     /// Points en mètres, Y = altitude du sol (+ surépaisseur anti z-fighting).
     pub points: Vec<[f32; 3]>,
     pub half_width_m: f32,
+    /// Nombre total de voies (choix du marquage).
+    pub lanes: u8,
+    /// Nœuds de départ et d'arrivée (indices) : carrefours et continuités.
+    pub nodes: [u32; 2],
 }
 
 /// Maillage de terrain prêt à téléverser.
@@ -149,10 +206,13 @@ pub fn buildings(world: &World) -> Vec<BuildingBlock> {
         };
         let ground = altitude_m(world, building.tile);
         let height = building_height_m(building.kind, building.capacity);
+        // Fondations : sur une pente, la boîte descend sous le sol au lieu de
+        // flotter au-dessus du côté aval.
+        let foundation = FOUNDATION_DEPTH_M;
         let cx = (x as f32 + 0.5) * tile_size;
         let cz = (y as f32 + 0.5) * tile_size;
         blocks.push(BuildingBlock {
-            min: [cx - half, ground, cz - half],
+            min: [cx - half, ground - foundation, cz - half],
             max: [cx + half, ground + height, cz + half],
             kind: building.kind,
         });
@@ -181,6 +241,8 @@ pub fn roads(world: &World) -> Vec<RoadStrip> {
         strips.push(RoadStrip {
             points,
             half_width_m: lanes * 3.5 * 0.5,
+            lanes: segment.spec.total_lanes(),
+            nodes: [segment.a.raw(), segment.b.raw()],
         });
     }
     strips
@@ -228,19 +290,16 @@ pub fn terrain(world: &World) -> TerrainMeshData {
     }
 }
 
-/// Surépaisseur de la chaussée au-dessus du terrain (évite le z-fighting).
-const ROAD_LIFT_M: f32 = 0.25;
+/// Profondeur des fondations sous l'altitude de la tuile (pentes ≤ 4 m/tuile).
+const FOUNDATION_DEPTH_M: f32 = 3.0;
 
-/// Altitude du sol, en mètres, à une position monde (mètres).
-fn altitude_at(world: &World, x: f32, z: f32) -> f32 {
-    let tile_size = world.config().tile_size_m as f32;
-    let grid = world.zoning().grid();
-    let tx = ((x / tile_size).floor().max(0.0)) as u32;
-    let tz = ((z / tile_size).floor().max(0.0)) as u32;
-    match grid.tile_at(tx.min(grid.width() - 1), tz.min(grid.height() - 1)) {
-        Some(tile) => altitude_m(world, tile),
-        None => 0.0,
-    }
+/// Surépaisseur de la chaussée au-dessus du terrain (évite le z-fighting).
+const ROAD_LIFT_M: f32 = 0.45;
+
+/// Altitude du sol, en mètres, à une position monde (mètres) : la même
+/// surface que le maillage du sol (bilinéaire), prolongée hors carte.
+pub(crate) fn altitude_at(world: &World, x: f32, z: f32) -> f32 {
+    crate::nature::ground_altitude_m(world, x, z)
 }
 
 /// Altitude en mètres d'une tuile (`Fixed` centimètres → f32 mètres).
@@ -287,19 +346,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn demo_boulevard_is_actually_curved() {
+    fn demo_city_builds_on_both_banks_with_a_curved_boulevard() {
         let mut world = demo_city();
         world.tick();
         let roads = world.roads();
-        // 10 avenues droites + 2 demi-boulevards courbes.
-        assert_eq!(roads.live_segments(), 12);
-        let curved: Vec<_> = roads
-            .segments()
-            .filter(|(_, seg)| !seg.curve.is_straight())
-            .collect();
-        assert_eq!(curved.len(), 2, "le boulevard doit être courbe");
-        for (_, seg) in &curved {
-            assert!(seg.length_m > seg.curve.p0.distance(seg.curve.p1));
+        assert!(roads.live_segments() >= 20, "{} segments", roads.live_segments());
+        let curved = roads.segments().filter(|(_, seg)| !seg.curve.is_straight()).count();
+        assert_eq!(curved, 2, "le boulevard doit être courbe");
+        // Aucune route ne part d'une tuile noyée.
+        let tile = world.config().tile_size_m as f32;
+        for (_, node) in roads.nodes() {
+            let (x, z) = (node.pos.x.to_f32() / tile, node.pos.y.to_f32() / tile);
+            let id = world.zoning().grid().tile_at(x as u32, z as u32).unwrap();
+            assert!(world.terrain().altitude_cm(id).unwrap() > 0, "nœud dans l'eau");
         }
     }
 

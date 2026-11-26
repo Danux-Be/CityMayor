@@ -61,6 +61,7 @@ pub mod spline;
 pub mod terrain;
 pub mod time;
 pub mod world;
+pub mod worldgen;
 pub mod zoning;
 
 pub use building::{Building, BuildingKind, BuildingTotals, Buildings};
@@ -79,6 +80,7 @@ pub use rng::Pcg32;
 pub use terrain::Terrain;
 pub use time::{Calendar, FixedStepClock, Tick, TickBatch};
 pub use world::{SimConfig, SimEvent, TickReport, World};
+pub use worldgen::{RiverParams, WorldGen, WorldGenParams};
 pub use zoning::{ZoneType, Zoning};
 
 /// Taille d'une tuile de terrain, en mètres. La grille est la source de vérité
