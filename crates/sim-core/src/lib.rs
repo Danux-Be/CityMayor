@@ -67,7 +67,7 @@ pub mod zoning;
 pub use building::{Building, BuildingKind, BuildingTotals, Buildings, ConstructionStage};
 pub use command::{Command, CommandError, Rect};
 pub use demand::{Demand, DemandParams};
-pub use economy::{BudgetParams, BudgetReport, Treasury};
+pub use economy::{BudgetBreakdown, BudgetParams, BudgetReport, Treasury, MAX_TAX_PERCENT, NEUTRAL_TAX_PERCENT};
 pub use fixed::Fixed;
 pub use grid::Grid;
 pub use ids::{BuildingId, NodeId, SegmentId, TileId};

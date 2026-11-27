@@ -111,6 +111,9 @@ pub enum Command {
     /// Démolit un segment de route. Un arc de rond-point emporte tout
     /// l'anneau (un rond-point ouvert n'a pas de sens).
     BulldozeRoad { segment: SegmentId },
+    /// Taux d'imposition (%) des habitants et des entreprises, bornés à
+    /// `economy::MAX_TAX_PERCENT`.
+    SetTaxes { residential_percent: u8, business_percent: u8 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

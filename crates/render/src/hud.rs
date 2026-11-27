@@ -22,7 +22,7 @@ use bevy::ui::{ComputedNode, UiGlobalTransform};
 use city_ui::text;
 use city_ui::tools::{Ghost, Tool, ToolController, ROUNDABOUT_RADII_M};
 use city_ui::Arg;
-use sim_core::{Fixed, RoadSpec, World, ZoneType};
+use sim_core::{Command, Fixed, Overlay, RoadSpec, SegmentId, TileId, World, ZoneType};
 
 use crate::nature::ground_altitude_m;
 use crate::scene::RoadStrip;
@@ -55,7 +55,20 @@ impl Plugin for HudPlugin {
             .add_systems(Startup, setup_hud)
             .add_systems(
                 Update,
-                (hud_hover, hud_buttons, hud_keys, tool_input, tool_test, update_ghost, update_stats, update_feed, update_tooltip).chain(),
+                (
+                    hud_hover,
+                    hud_buttons,
+                    hud_keys,
+                    tool_input,
+                    tool_test,
+                    update_ghost,
+                    update_stats,
+                    update_feed,
+                    update_tooltip,
+                    update_panels,
+                    update_overlay,
+                )
+                    .chain(),
             );
     }
 }
@@ -73,7 +86,61 @@ pub struct Tools {
     /// Point au sol sous le curseur (m, plan de la carte).
     cursor: Option<[f32; 2]>,
     ghost: Option<Ghost>,
+    /// Vue d'information affichée sur le sol.
+    overlay: Option<Overlay>,
+    budget_open: bool,
+    /// Bâtiment ou route dont le panneau d'infos est ouvert.
+    selected: Option<Selected>,
+    /// Position du curseur à l'appui du bouton gauche (clic ou glisser ?).
+    press_at: Option<Vec2>,
 }
+
+/// Objet inspecté.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Selected {
+    Building(TileId),
+    Road(SegmentId),
+}
+
+/// Panneaux à lignes « libellé — valeur ».
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelKind {
+    Budget,
+    Info,
+}
+
+/// Lignes par panneau.
+const PANEL_ROWS: usize = 8;
+
+#[derive(Component)]
+struct PanelRoot(PanelKind);
+
+#[derive(Component)]
+struct PanelTitle(PanelKind);
+
+#[derive(Component)]
+struct PanelRow(PanelKind, usize);
+
+#[derive(Component)]
+struct RowLabel(PanelKind, usize);
+
+#[derive(Component)]
+struct RowValue(PanelKind, usize);
+
+#[derive(Component)]
+struct TaxValue(usize);
+
+#[derive(Component)]
+struct Legend;
+
+#[derive(Component)]
+struct LegendText(usize);
+
+#[derive(Component)]
+struct LegendSwatch(usize);
+
+#[derive(Component)]
+struct OverlayMesh;
 
 /// Le curseur est-il sur un panneau (le clic n'atteint pas le monde) ?
 #[derive(Resource, Default, Debug)]
@@ -98,6 +165,7 @@ enum Category {
     Roundabout,
     Zoning,
     Bulldoze,
+    InfoViews,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +176,11 @@ enum Action {
     Curved(bool),
     Roundabout(usize),
     Zone(ZoneType),
+    Overlay(Option<Overlay>),
+    ToggleBudget,
+    /// Taux (0 : habitants, 1 : entreprises), variation en points.
+    Tax(usize, i8),
+    CloseInfo,
 }
 
 #[derive(Component)]
@@ -271,6 +344,8 @@ fn setup_hud(
                         });
                 });
             bar.spawn(Node { flex_direction: FlexDirection::Row, column_gap: Val::Px(6.0), ..default() }).with_children(|speeds| {
+                spawn_button(speeds, &hud_font, t("hud-budget"), Action::ToggleBudget, 90.0);
+                speeds.spawn(Node { width: Val::Px(14.0), ..default() });
                 for (speed, key) in [(0u8, "hud-speed-label-pause"), (1, "hud-speed-label-normal"), (2, "hud-speed-label-fast"), (3, "hud-speed-label-fastest")] {
                     spawn_button(speeds, &hud_font, t(key), Action::Speed(speed), 44.0);
                 }
@@ -321,6 +396,12 @@ fn setup_hud(
             spawn_button(p, &hud_font, t(key), Action::Roundabout(i), 0.0);
         }
     });
+    sub(&mut commands, Category::InfoViews, &|p| {
+        for overlay in Overlay::ALL.into_iter().filter(|o| o.is_implemented()) {
+            spawn_button(p, &hud_font, t(overlay.message_key()), Action::Overlay(Some(overlay)), 0.0);
+        }
+        spawn_button(p, &hud_font, t("overlay-off"), Action::Overlay(None), 0.0);
+    });
     sub(&mut commands, Category::Zoning, &|p| {
         for zone in [ZoneType::Residential, ZoneType::Commercial, ZoneType::Industrial, ZoneType::Unzoned] {
             spawn_button(p, &hud_font, t(zone.message_key()), Action::Zone(zone), 0.0);
@@ -355,6 +436,7 @@ fn setup_hud(
                     (Category::Roundabout, "tool-roundabout"),
                     (Category::Zoning, "tool-zoning"),
                     (Category::Bulldoze, "tool-bulldoze"),
+                    (Category::InfoViews, "tool-info-views"),
                 ] {
                     spawn_button(bar, &hud_font, t(key), Action::Category(category), 118.0);
                 }
@@ -412,7 +494,124 @@ fn setup_hud(
                 ));
             }
         });
+    // --- panneaux : budget (à gauche), infos (à droite), légende
+    spawn_panel(&mut commands, &hud_font, PanelKind::Budget, |panel| {
+        for (i, key) in ["budget-tax-residential", "budget-tax-business"].iter().enumerate() {
+            panel
+                .spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    margin: UiRect::top(Val::Px(6.0)),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((Text::new(t(key)), font(&hud_font, 13.0, 500), TextColor(TEXT)));
+                    row.spawn(Node { flex_direction: FlexDirection::Row, align_items: AlignItems::Center, column_gap: Val::Px(6.0), ..default() })
+                        .with_children(|ctl| {
+                            spawn_button(ctl, &hud_font, "−".into(), Action::Tax(i, -1), 30.0);
+                            ctl.spawn((TaxValue(i), Text::new(""), font(&hud_font, 14.0, 700), TextColor(TEXT), Node { min_width: Val::Px(38.0), justify_content: JustifyContent::Center, ..default() }));
+                            spawn_button(ctl, &hud_font, "+".into(), Action::Tax(i, 1), 30.0);
+                        });
+                });
+        }
+        panel.spawn((
+            Text::new(t("budget-tax-hint")),
+            font(&hud_font, 11.0, 400),
+            TextColor(TEXT_DIM),
+            Node { margin: UiRect::top(Val::Px(8.0)), max_width: Val::Px(300.0), ..default() },
+        ));
+    });
+    spawn_panel(&mut commands, &hud_font, PanelKind::Info, |_| {});
+    commands
+        .spawn((
+            Legend,
+            Blocker,
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(14.0),
+                bottom: Val::Px(92.0),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(Val::Px(10.0)),
+                row_gap: Val::Px(6.0),
+                border_radius: BorderRadius::all(Val::Px(10.0)),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(PANEL),
+        ))
+        .with_children(|legend| {
+            legend.spawn((LegendText(0), Text::new(""), font(&hud_font, 14.0, 700), TextColor(TEXT)));
+            legend.spawn(Node { flex_direction: FlexDirection::Row, column_gap: Val::Px(2.0), ..default() }).with_children(|row| {
+                for i in 0..5 {
+                    row.spawn((LegendSwatch(i), Node { width: Val::Px(34.0), height: Val::Px(10.0), ..default() }, BackgroundColor(Color::NONE)));
+                }
+            });
+            legend.spawn(Node { flex_direction: FlexDirection::Row, justify_content: JustifyContent::SpaceBetween, column_gap: Val::Px(30.0), ..default() }).with_children(|row| {
+                row.spawn((LegendText(1), Text::new(""), font(&hud_font, 11.0, 500), TextColor(TEXT_DIM)));
+                row.spawn((LegendText(2), Text::new(""), font(&hud_font, 11.0, 500), TextColor(TEXT_DIM)));
+            });
+        });
+    commands.spawn((
+        OverlayMesh,
+        Mesh3d(meshes.add(Mesh::new(bevy::mesh::PrimitiveTopology::TriangleList, RenderAssetUsages::default()))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            cull_mode: None,
+            ..default()
+        })),
+        Transform::default(),
+        Visibility::Hidden,
+        NoFrustumCulling,
+    ));
     commands.insert_resource(hud_font);
+}
+
+/// Panneau à titre et lignes « libellé — valeur » (+ contenu propre).
+fn spawn_panel(commands: &mut Commands, hud_font: &HudFont, kind: PanelKind, extra: impl FnOnce(&mut ChildSpawnerCommands)) {
+    let (side, top) = match kind {
+        PanelKind::Budget => (UiRect { left: Val::Px(14.0), right: Val::Auto, ..default() }, 64.0),
+        PanelKind::Info => (UiRect { left: Val::Auto, right: Val::Px(14.0), ..default() }, 230.0),
+    };
+    commands
+        .spawn((
+            PanelRoot(kind),
+            Blocker,
+            Node {
+                position_type: PositionType::Absolute,
+                left: side.left,
+                right: side.right,
+                top: Val::Px(top),
+                width: Val::Px(330.0),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(Val::Px(14.0)),
+                row_gap: Val::Px(3.0),
+                border_radius: BorderRadius::all(Val::Px(12.0)),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(PANEL),
+        ))
+        .with_children(|panel| {
+            panel
+                .spawn(Node { flex_direction: FlexDirection::Row, justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, margin: UiRect::bottom(Val::Px(6.0)), ..default() })
+                .with_children(|head| {
+                    head.spawn((PanelTitle(kind), Text::new(""), font(hud_font, 17.0, 700), TextColor(TEXT)));
+                    let close = if kind == PanelKind::Budget { Action::ToggleBudget } else { Action::CloseInfo };
+                    spawn_button(head, hud_font, "×".into(), close, 30.0);
+                });
+            for i in 0..PANEL_ROWS {
+                panel
+                    .spawn((PanelRow(kind, i), Node { flex_direction: FlexDirection::Row, justify_content: JustifyContent::SpaceBetween, display: Display::None, ..default() }))
+                    .with_children(|row| {
+                        row.spawn((RowLabel(kind, i), Text::new(""), font(hud_font, 13.0, 500), TextColor(TEXT_DIM)));
+                        row.spawn((RowValue(kind, i), Text::new(""), font(hud_font, 13.0, 600), TextColor(TEXT)));
+                    });
+            }
+            extra(panel);
+        });
 }
 
 fn spawn_button(parent: &mut ChildSpawnerCommands, hud_font: &HudFont, label: String, action: Action, min_width: f32) {
@@ -466,6 +665,9 @@ fn is_active(action: Action, tools: &Tools, sim: &Sim) -> bool {
         Action::Curved(c) => matches!(tools.controller.tool, Tool::Road { .. }) && tools.curved == c,
         Action::Roundabout(i) => matches!(tools.controller.tool, Tool::Roundabout { .. }) && tools.roundabout == i,
         Action::Zone(z) => tools.controller.tool == Tool::Zone(z),
+        Action::Overlay(o) => tools.overlay == o,
+        Action::ToggleBudget => tools.budget_open,
+        Action::Tax(..) | Action::CloseInfo => false,
     }
 }
 
@@ -480,6 +682,12 @@ fn apply(action: Action, tools: &mut Tools, sim: &mut Sim) {
             }
             tools.open = (c != Category::Bulldoze).then_some(c);
             let tool = match c {
+                Category::InfoViews => {
+                    if tools.overlay.is_none() {
+                        tools.overlay = Some(Overlay::LandValue);
+                    }
+                    Tool::Select
+                }
                 Category::Roads => road_tool(tools),
                 Category::Roundabout => Tool::Roundabout { radius_m: ROUNDABOUT_RADII_M[tools.roundabout] },
                 Category::Zoning => Tool::Zone(ZoneType::Residential),
@@ -502,6 +710,14 @@ fn apply(action: Action, tools: &mut Tools, sim: &mut Sim) {
             tools.controller.set_tool(Tool::Roundabout { radius_m: ROUNDABOUT_RADII_M[i] });
         }
         Action::Zone(z) => tools.controller.set_tool(Tool::Zone(z)),
+        Action::Overlay(o) => tools.overlay = o,
+        Action::ToggleBudget => tools.budget_open = !tools.budget_open,
+        Action::Tax(index, delta) => {
+            let mut rates = sim.world.treasury().tax_percent;
+            rates[index] = rates[index].saturating_add_signed(delta).min(sim_core::MAX_TAX_PERCENT);
+            sim.world.queue(Command::SetTaxes { residential_percent: rates[0], business_percent: rates[1] });
+        }
+        Action::CloseInfo => tools.selected = None,
     }
 }
 
@@ -621,12 +837,27 @@ fn tool_input(
     if test.active {
         return;
     }
+    let cursor = windows.iter().next().and_then(Window::cursor_position);
     if tools.controller.tool == Tool::Select {
         tools.cursor = None;
         tools.ghost = None;
+        // Sans outil : un clic (sans glisser) inspecte un bâtiment ou une route.
+        if mouse.just_pressed(MouseButton::Left) && !over.0 {
+            tools.press_at = cursor;
+        }
+        if mouse.just_released(MouseButton::Left) {
+            let pressed = tools.press_at.take();
+            if let (Some(from), Some(to)) = (pressed, cursor) {
+                if from.distance(to) < 5.0 && !over.0 {
+                    let ground = cameras.iter().next().and_then(|(camera, transform)| {
+                        camera.viewport_to_world(transform, to).ok().and_then(|ray| ground_under_cursor(&sim.world, ray))
+                    });
+                    tools.selected = ground.and_then(|g| pick(&sim.world, g));
+                }
+            }
+        }
         return;
     }
-    let cursor = windows.iter().next().and_then(Window::cursor_position);
     let ground = cursor.and_then(|c| {
         let (camera, transform) = cameras.iter().next()?;
         let ray = camera.viewport_to_world(transform, c).ok()?;
@@ -666,6 +897,291 @@ fn tool_input(
         }
     }
     tools.ghost = Some(tools.controller.ghost(&sim.world, ground));
+}
+
+/// Bâtiment sur la tuile visée, sinon route sous le point.
+fn pick(world: &World, ground: [f32; 2]) -> Option<Selected> {
+    let size = world.config().tile_size_m as f32;
+    let tile = world.zoning().grid().tile_at((ground[0] / size) as u32, (ground[1] / size) as u32);
+    if let Some(tile) = tile.filter(|t| world.buildings().at(*t).is_some()) {
+        return Some(Selected::Building(tile));
+    }
+    city_ui::tools::road_under(world, ground).map(Selected::Road)
+}
+
+/// Contenu d'un panneau : titre et lignes (libellé, valeur).
+fn panel_content(kind: PanelKind, tools: &Tools, world: &World, texts: &Texts) -> Option<(String, Vec<(String, String)>)> {
+    let pct = |v: f32| texts.format("info-percent", &[("percent", Arg::from((v * 100.0).round()))]);
+    match kind {
+        PanelKind::Budget => {
+            if !tools.budget_open {
+                return None;
+            }
+            let estimate = world.budget_estimate();
+            let signed = |cents: i64| {
+                let sign = if cents < 0 { "−" } else { "+" };
+                texts.format("money-signed", &[("sign", Arg::from(sign)), ("value", Arg::from(text::number(texts, cents.abs() / 100)))])
+            };
+            let last = world.treasury().last_breakdown;
+            Some((
+                texts.text("budget-title"),
+                vec![
+                    (texts.text("budget-funds"), text::money(texts, world.treasury().funds_cents)),
+                    (texts.text("budget-this-month"), String::new()),
+                    (texts.text("budget-residential-tax"), signed(estimate.residential_tax_cents)),
+                    (texts.text("budget-business-tax"), signed(estimate.business_tax_cents)),
+                    (texts.text("budget-road-upkeep"), signed(-estimate.road_upkeep_cents)),
+                    (texts.text("budget-building-upkeep"), signed(-estimate.building_upkeep_cents)),
+                    (texts.text("budget-net"), signed(estimate.net_cents())),
+                    (texts.text("budget-last-month"), signed(last.net_cents())),
+                ],
+            ))
+        }
+        PanelKind::Info => match tools.selected? {
+            Selected::Building(tile) => {
+                let id = world.buildings().at(tile)?;
+                let b = world.buildings().get(id)?;
+                let (stage, _) = b.stage(world.current_tick());
+                let progress = b.construction_progress(world.current_tick());
+                let land = world.overlay_cell(Overlay::LandValue, tile).map_or(0.0, |v| v.to_f32());
+                let mut rows = vec![
+                    (texts.text("info-type"), text::building_kind(texts, b.kind)),
+                    (texts.text("info-status"), text::construction(texts, stage, progress)),
+                    (texts.text("info-capacity"), text::number(texts, i64::from(b.capacity))),
+                ];
+                if b.is_household() {
+                    rows.push((texts.text("info-residents"), text::number(texts, i64::from(b.occupants))));
+                } else {
+                    rows.push((texts.text("info-jobs"), text::number(texts, i64::from(if b.complete { b.capacity } else { 0 }))));
+                }
+                rows.push((texts.text("info-land-value"), pct(land)));
+                Some((texts.text("info-building"), rows))
+            }
+            Selected::Road(segment) => {
+                let seg = world.roads().segment(segment)?;
+                let now = world.current_tick();
+                let status = if seg.is_open(now) {
+                    texts.text("info-open")
+                } else {
+                    texts.format("road-under-construction", &[("percent", Arg::from((seg.construction_progress(now).to_f32() * 100.0).round()))])
+                };
+                Some((
+                    text::road_type(texts, seg.spec),
+                    vec![
+                        (texts.text("info-status"), status),
+                        (texts.text("info-length"), texts.format("unit-meters", &[("value", Arg::from(seg.length_m.to_f32().round()))])),
+                        (texts.text("info-speed"), texts.format("road-speed-limit", &[("speed", Arg::from(seg.spec.speed_kph))])),
+                        (
+                            texts.text("info-lanes"),
+                            texts.format("info-lanes-value", &[("forward", Arg::from(seg.spec.forward_lanes)), ("backward", Arg::from(seg.spec.backward_lanes))]),
+                        ),
+                    ],
+                ))
+            }
+        },
+    }
+}
+
+/// Couleurs de la légende et du sol pour une vue : (bas → haut).
+fn overlay_ramp(overlay: Overlay) -> [[f32; 4]; 5] {
+    match overlay {
+        // Zonage : non zoné (transparent), R, C, I.
+        Overlay::Zone => [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.3, 0.85, 0.35, 0.5],
+            [0.3, 0.55, 1.0, 0.5],
+            [1.0, 0.78, 0.2, 0.5],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        Overlay::RoadAccess => [
+            [0.95, 0.3, 0.25, 0.35],
+            [0.95, 0.3, 0.25, 0.35],
+            [0.95, 0.3, 0.25, 0.35],
+            [0.3, 0.9, 0.4, 0.45],
+            [0.3, 0.9, 0.4, 0.45],
+        ],
+        _ => [
+            [0.85, 0.15, 0.12, 0.5],
+            [0.95, 0.5, 0.15, 0.5],
+            [0.98, 0.85, 0.2, 0.5],
+            [0.55, 0.85, 0.25, 0.5],
+            [0.15, 0.7, 0.3, 0.5],
+        ],
+    }
+}
+
+/// Couleur d'une tuile pour une valeur de vue `[0, 1]`.
+fn overlay_color(overlay: Overlay, value: f32) -> [f32; 4] {
+    let ramp = overlay_ramp(overlay);
+    match overlay {
+        Overlay::Zone => ramp[((value * 3.0).round() as usize).min(3)],
+        Overlay::RoadAccess => if value > 0.5 { ramp[4] } else { ramp[0] },
+        _ => {
+            let t = value.clamp(0.0, 1.0) * 4.0;
+            let (i, f) = ((t.floor() as usize).min(3), t - t.floor().min(3.0));
+            let (a, b) = (ramp[i], ramp[i + 1]);
+            [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f, a[3] + (b[3] - a[3]) * f]
+        }
+    }
+}
+
+// Requêtes Bevy disjointes (`Without<…>`) : leur type est long par nature.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn update_panels(
+    tools: Res<Tools>,
+    sim: Res<Sim>,
+    texts: Res<Texts>,
+    mut roots: Query<(&PanelRoot, &mut Node), (Without<PanelRow>, Without<Legend>)>,
+    mut titles: Query<(&PanelTitle, &mut Text), (Without<RowLabel>, Without<RowValue>, Without<TaxValue>, Without<LegendText>)>,
+    mut rows: Query<(&PanelRow, &mut Node), (Without<PanelRoot>, Without<Legend>)>,
+    mut labels: Query<(&RowLabel, &mut Text), (Without<PanelTitle>, Without<RowValue>, Without<TaxValue>, Without<LegendText>)>,
+    mut values: Query<(&RowValue, &mut Text), (Without<PanelTitle>, Without<RowLabel>, Without<TaxValue>, Without<LegendText>)>,
+    mut taxes: Query<(&TaxValue, &mut Text), (Without<PanelTitle>, Without<RowLabel>, Without<RowValue>, Without<LegendText>)>,
+    mut legend: Query<&mut Node, (With<Legend>, Without<PanelRoot>, Without<PanelRow>)>,
+    mut legend_texts: Query<(&LegendText, &mut Text), (Without<PanelTitle>, Without<RowLabel>, Without<RowValue>, Without<TaxValue>)>,
+    mut swatches: Query<(&LegendSwatch, &mut BackgroundColor)>,
+) {
+    let world = &sim.world;
+    for kind in [PanelKind::Budget, PanelKind::Info] {
+        let content = panel_content(kind, &tools, world, &texts);
+        for (root, mut node) in &mut roots {
+            if root.0 == kind {
+                let display = if content.is_some() { Display::Flex } else { Display::None };
+                if node.display != display {
+                    node.display = display;
+                }
+            }
+        }
+        let Some((title, lines)) = content else { continue };
+        let set = |text: &mut Text, value: &str| {
+            if text.0 != value {
+                text.0 = value.to_owned();
+            }
+        };
+        for (t, mut text) in &mut titles {
+            if t.0 == kind {
+                set(&mut text, &title);
+            }
+        }
+        for (row, mut node) in &mut rows {
+            if row.0 == kind {
+                let display = if row.1 < lines.len() { Display::Flex } else { Display::None };
+                if node.display != display {
+                    node.display = display;
+                }
+            }
+        }
+        for (label, mut text) in &mut labels {
+            if label.0 == kind {
+                if let Some((l, _)) = lines.get(label.1) {
+                    set(&mut text, l);
+                }
+            }
+        }
+        for (value, mut text) in &mut values {
+            if value.0 == kind {
+                if let Some((_, v)) = lines.get(value.1) {
+                    set(&mut text, v);
+                }
+            }
+        }
+    }
+    let rates = world.treasury().tax_percent;
+    for (tax, mut text) in &mut taxes {
+        let value = texts.format("budget-tax-value", &[("percent", Arg::from(rates[tax.0]))]);
+        if text.0 != value {
+            text.0 = value;
+        }
+    }
+    // Légende de la vue d'information.
+    let Ok(mut legend_node) = legend.single_mut() else { return };
+    let Some(overlay) = tools.overlay else {
+        legend_node.display = Display::None;
+        return;
+    };
+    legend_node.display = Display::Flex;
+    let (low, high) = match overlay {
+        Overlay::RoadAccess => ("legend-not-served", "legend-served"),
+        Overlay::Zone => ("legend-zones", "legend-empty"),
+        _ => ("legend-low", "legend-high"),
+    };
+    for (lt, mut text) in &mut legend_texts {
+        let value = match lt.0 {
+            0 => texts.text(overlay.message_key()),
+            1 => texts.text(low),
+            _ => texts.text(high),
+        };
+        if text.0 != value {
+            text.0 = value;
+        }
+    }
+    let ramp = overlay_ramp(overlay);
+    for (swatch, mut color) in &mut swatches {
+        let c = ramp[swatch.0];
+        // Zonage : trois cases R, C, I ; les autres vues : un dégradé.
+        let wanted = if overlay == Overlay::Zone && (swatch.0 == 0 || swatch.0 == 4) {
+            Color::NONE
+        } else {
+            Color::srgba(c[0], c[1], c[2], 1.0)
+        };
+        if color.0 != wanted {
+            color.0 = wanted;
+        }
+    }
+}
+
+/// Vue d'information : une tuile colorée par case, posée sur le relief.
+/// Reconstruite au changement de vue, puis toutes les deux secondes.
+fn update_overlay(
+    time: Res<Time>,
+    tools: Res<Tools>,
+    sim: Res<Sim>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut overlay: Query<(&Mesh3d, &mut Visibility), With<OverlayMesh>>,
+    mut state: Local<(Option<Overlay>, f32)>,
+) {
+    let Ok((mesh, mut visibility)) = overlay.single_mut() else { return };
+    state.1 += time.delta_secs();
+    if state.0 == tools.overlay && state.1 < 2.0 {
+        return;
+    }
+    state.0 = tools.overlay;
+    state.1 = 0.0;
+    let Some(kind) = tools.overlay else {
+        *visibility = Visibility::Hidden;
+        return;
+    };
+    let world = &sim.world;
+    let grid = world.zoning().grid();
+    let size = world.config().tile_size_m as f32;
+    let (mut positions, mut colors, mut indices) = (Vec::new(), Vec::new(), Vec::new());
+    for y in 0..grid.height() {
+        for x in 0..grid.width() {
+            let Some(tile) = grid.tile_at(x, y) else { continue };
+            let Some(value) = world.overlay_cell(kind, tile) else { continue };
+            let color = overlay_color(kind, value.to_f32());
+            if color[3] <= 0.0 {
+                continue;
+            }
+            let base = positions.len() as u32;
+            for (cx, cz) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                let (px, pz) = ((x as f32 + cx) * size, (y as f32 + cz) * size);
+                positions.push([px, ground_altitude_m(world, px, pz) + 0.7, pz]);
+                colors.push(color);
+            }
+            indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+        }
+    }
+    let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
+    let mut data = Mesh::new(bevy::mesh::PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    data.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    data.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    data.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    data.insert_indices(bevy::mesh::Indices::U32(indices));
+    if let Some(mut target) = meshes.get_mut(&mesh.0) {
+        *target = data;
+    }
+    *visibility = Visibility::Visible;
 }
 
 /// Ruban de route fantôme le long d'une courbe (m), au-dessus du sol.
@@ -919,6 +1435,23 @@ const TEST_Z: f32 = 300.0;
 /// Un geste scripté : bouton enfoncé ?, relâché ?, point au sol (m).
 type Gesture = (bool, bool, [f32; 2]);
 
+/// Panneaux ouverts à une étape du scénario.
+#[derive(Clone, Copy, Debug, Default)]
+struct TestPanels {
+    budget: bool,
+    overlay: Option<Overlay>,
+    inspect: Option<[f32; 2]>,
+}
+
+fn tool_test_panels(step: usize) -> TestPanels {
+    match step {
+        6 => TestPanels { budget: true, ..default() },
+        7 => TestPanels { overlay: Some(Overlay::LandValue), ..default() },
+        8 => TestPanels { overlay: Some(Overlay::Zone), inspect: Some([TEST_X + 4.0, 180.0]), ..default() },
+        _ => TestPanels::default(),
+    }
+}
+
 fn tool_test_steps() -> Vec<(&'static str, Tool, Vec<Gesture>)> {
     let road = Tool::Road { spec: RoadSpec::TWO_WAY, curved: false };
     let curve = Tool::Road { spec: RoadSpec::BOULEVARD, curved: true };
@@ -930,6 +1463,9 @@ fn tool_test_steps() -> Vec<(&'static str, Tool, Vec<Gesture>)> {
         ("4-zonage-fantome", Tool::Zone(ZoneType::Residential), vec![(true, false, p(-90.0, 14.0)), (false, false, p(80.0, 30.0))]),
         ("5-rond-point-fantome", Tool::Roundabout { radius_m: ROUNDABOUT_RADII_M[1] }, vec![(false, false, p(0.0, -70.0))]),
         ("6-demolition-fantome", Tool::Bulldoze, vec![(false, false, p(0.0, 1.0))]),
+        ("7-budget", Tool::Select, vec![]),
+        ("8-vue-valeur-fonciere", Tool::Select, vec![]),
+        ("9-infos-batiment", Tool::Select, vec![]),
     ]
 }
 
@@ -959,6 +1495,13 @@ fn tool_test(
         }
         if tools.controller.tool != tool {
             tools.controller.set_tool(tool);
+        }
+        let panels = tool_test_panels(test.step);
+        tools.budget_open = panels.budget;
+        tools.overlay = panels.overlay;
+        tools.selected = panels.inspect.and_then(|g| pick(&sim.world, g));
+        if tool == Tool::Select {
+            tools.ghost = None;
         }
     }
     test.elapsed += time.delta_secs();

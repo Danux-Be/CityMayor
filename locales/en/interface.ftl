@@ -56,3 +56,50 @@ tool-hint-bulldoze = Click a road, or drag over buildings.
 
 tool-error-too-short = Too short.
 tool-error-water = Roads can't cross water yet.
+
+## Budget panel
+
+hud-budget = Budget
+budget-title = City budget
+budget-funds = Funds
+budget-this-month = This month (estimate)
+budget-residential-tax = Residential taxes
+budget-business-tax = Business taxes
+budget-road-upkeep = Road upkeep
+budget-building-upkeep = Building upkeep
+budget-net = Balance
+budget-last-month = Last month
+budget-tax-residential = Residential tax rate
+budget-tax-business = Business tax rate
+budget-tax-value = { $percent }%
+budget-tax-hint = Higher taxes bring in more money but slow the city's growth.
+money-signed = { $sign }${ $value }
+
+## Info views
+
+tool-info-views = Info views
+overlay-off = Off
+legend-low = Low
+legend-high = High
+legend-served = Served by a road
+legend-not-served = Not served
+legend-zones = Residential · Commercial · Industrial
+legend-empty = { "" }
+
+## Info panel
+
+info-building = Building
+info-road = Road
+info-type = Type
+info-status = Status
+info-capacity = Capacity
+info-residents = Residents
+info-jobs = Jobs
+info-land-value = Land value
+info-length = Length
+info-speed = Speed limit
+info-lanes = Lanes
+info-lanes-value = { $forward } → · { $backward } ←
+info-open = Open to traffic
+info-percent = { $percent }%
+info-hint = Click a building or a road to see its details.
