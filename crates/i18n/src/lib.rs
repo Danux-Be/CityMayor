@@ -258,8 +258,11 @@ mod tests {
     fn formats_arguments_and_plurals() {
         let en = Localizer::english();
         assert_eq!(en.text("app-title"), "CityMayor");
-        assert_eq!(en.format("unit-inhabitants", &[("count", 1.into())]), "1 inhabitant");
-        assert_eq!(en.format("unit-inhabitants", &[("count", 1250.into())]), "1250 inhabitants");
+        assert_eq!(en.format("unit-inhabitants", &[("count", 1.into()), ("formatted", "1".into())]), "1 inhabitant");
+        assert_eq!(
+            en.format("unit-inhabitants", &[("count", 1250.into()), ("formatted", "1,250".into())]),
+            "1,250 inhabitants"
+        );
     }
 
     #[test]

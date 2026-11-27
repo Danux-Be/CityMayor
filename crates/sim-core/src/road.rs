@@ -379,6 +379,30 @@ impl RoadNetwork {
         self.segments().map(|(_, s)| s.opens_at).filter(|t| *t > now).min()
     }
 
+    /// Démolit un segment ; si c'est un arc de rond-point, tout l'anneau.
+    /// Renvoie le nombre de segments supprimés.
+    ///
+    /// # Errors
+    /// Segment inconnu.
+    pub fn bulldoze(&mut self, id: SegmentId) -> Result<u32, RoadError> {
+        let seg = *self.segment(id).ok_or(RoadError::UnknownSegment(id))?;
+        let ring = self.roundabouts.iter().position(|r| r.nodes.contains(&seg.a) && r.nodes.contains(&seg.b));
+        let Some(index) = ring else {
+            self.disconnect(id)?;
+            return Ok(1);
+        };
+        let roundabout = self.roundabouts.remove(index);
+        let mut removed = 0;
+        for i in 0..roundabout.nodes.len() {
+            let (a, b) = (roundabout.nodes[i], roundabout.nodes[(i + 1) % roundabout.nodes.len()]);
+            if let Some(s) = self.find_segment(a, b) {
+                self.disconnect(s)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Construit un rond-point de 8 nœuds autour de `center`.
     ///
     /// La géométrie est exacte en arithmétique entière : les nœuds sont aux

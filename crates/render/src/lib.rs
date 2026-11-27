@@ -35,4 +35,6 @@ pub mod site;
 pub mod urban;
 
 #[cfg(feature = "viewer")]
+pub mod hud;
+#[cfg(feature = "viewer")]
 pub mod viewer;

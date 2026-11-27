@@ -182,6 +182,10 @@ pub enum SimEvent {
         id: BuildingId,
         kind: BuildingKind,
     },
+    /// Des segments de route ont été démolis.
+    RoadsRemoved {
+        count: u32,
+    },
     /// Des chantiers de route se sont achevés : les routes sont ouvertes.
     RoadsOpened {
         count: u32,
@@ -398,6 +402,12 @@ impl World {
         &self.demand
     }
 
+    /// Budget du mois en cours si la ville restait telle qu'elle est.
+    #[must_use]
+    pub fn budget_estimate(&self) -> crate::economy::BudgetBreakdown {
+        self.treasury.estimate(&self.census, self.roads.live_segments(), self.buildings.live_count(), &self.config.budget)
+    }
+
     #[must_use]
     pub const fn treasury(&self) -> &Treasury {
         &self.treasury
@@ -449,7 +459,7 @@ impl World {
             self.census.happiness,
             self.config.happiness_smoothing,
         );
-        self.demand = demand::compute(&self.census, &self.config.demand);
+        self.demand = demand::apply_taxes(demand::compute(&self.census, &self.config.demand), self.treasury.tax_percent);
 
         self.tick = executed.next();
 
@@ -525,6 +535,18 @@ impl World {
                 Command::BuildRoundabout { center, radius_m, spec } => {
                     self.build_roundabout(center, radius_m, spec);
                 }
+                Command::SetTaxes { residential_percent, business_percent } => {
+                    self.treasury.set_tax_percent(residential_percent, business_percent);
+                }
+                Command::BulldozeRoad { segment } => match self.roads.bulldoze(segment) {
+                    Ok(count) => {
+                        self.roads.ensure_topology();
+                        self.road_access_dirty = true;
+                        self.next_road_opening = self.roads.next_opening(self.tick);
+                        self.events.push(SimEvent::RoadsRemoved { count });
+                    }
+                    Err(error) => self.events.push(SimEvent::CommandRejected { error: CommandError::Road(error) }),
+                },
             }
         }
     }

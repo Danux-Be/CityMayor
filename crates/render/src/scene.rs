@@ -173,6 +173,23 @@ pub fn demo_city() -> World {
     world
 }
 
+/// Petit pâté de maisons pour les tests d'outils : carte de 64 × 64 tuiles
+/// (512 m), deux rues, un îlot zoné, et de la place libre au sud.
+#[must_use]
+pub fn small_block() -> World {
+    let config = SimConfig { road_access_radius_tiles: 3, road_construction: false, ..SimConfig::default() };
+    // Sans fleuve : le pâté et la place libre autour restent au sec.
+    let params = WorldGenParams { river: None, ..WorldGenParams::default() };
+    let mut world = World::generated(config, 0x0C17_CAFE, params, 64, 64);
+    let at = |x: i32, y: i32| Point::new(tile_center_m(x), tile_center_m(y));
+    for (from, to) in [((8, 20), (56, 20)), ((8, 20), (8, 32)), ((56, 20), (56, 32))] {
+        world.queue(Command::BuildRoad { from: at(from.0, from.1), to: at(to.0, to.1), spec: RoadSpec::TWO_WAY });
+    }
+    world.queue(Command::ZoneRect { rect: Rect::new(10, 22, 54, 23), zone: ZoneType::Residential });
+    world.queue(Command::ZoneRect { rect: Rect::new(10, 17, 54, 18), zone: ZoneType::Commercial });
+    world
+}
+
 /// Rangée (tuiles) de l'autoroute de la démo.
 pub const DEMO_HIGHWAY_ROW: u32 = 9;
 /// Rayon de l'anneau du rond-point de la démo (m).
@@ -460,6 +477,16 @@ pub fn block_is_sane(block: &BuildingBlock) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_block_is_dry_land_with_room_to_build() {
+        let world = small_block();
+        let max_slope = world.config().max_slope_cm;
+        let grid = world.zoning().grid();
+        let dry = (12..52).flat_map(|y| (6..58).map(move |x| (x, y)));
+        let wet: Vec<_> = dry.filter(|&(x, y)| !grid.tile_at(x, y).is_some_and(|t| world.terrain().is_buildable(t, max_slope))).collect();
+        assert!(wet.len() < 40, "{} tuiles non constructibles", wet.len());
+    }
 
     #[test]
     fn demo_city_builds_on_both_banks_with_a_curved_boulevard() {

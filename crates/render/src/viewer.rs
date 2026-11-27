@@ -46,7 +46,7 @@ use sim_core::{FixedStepClock, World, ZoneType};
 
 use std::collections::HashMap;
 
-use crate::{nature, roads, scene, urban};
+use crate::{hud, nature, roads, scene, urban};
 
 /// Ticks simulés avant d'ouvrir la fenêtre : la ville est déjà peuplée.
 const PRESIMULATION_TICKS: u32 = 2_400;
@@ -105,8 +105,16 @@ impl MaterialExtension for UrbanExtension {
 
 /// Lancée par le binaire `city-viewer`.
 pub fn run() {
-    let mut world = scene::demo_city();
-    for tick in 0..PRESIMULATION_TICKS {
+    // Test des outils : un petit pâté de maisons suffit (démarrage rapide,
+    // pas une carte entière de chantiers).
+    let tool_test = std::env::var_os("CITYMAYOR_TOOLTEST").is_some();
+    let mut world = if tool_test { scene::small_block() } else { scene::demo_city() };
+    let presimulation = if tool_test { 1_500 } else { PRESIMULATION_TICKS };
+    for tick in 0..presimulation {
+        if tool_test {
+            world.tick();
+            continue;
+        }
         // À mi-parcours : un chantier d'autoroute, encore en cours à l'ouverture.
         if tick == PRESIMULATION_TICKS / 2 {
             scene::demo_road_works(&mut world);
@@ -133,6 +141,7 @@ pub fn run() {
         MaterialPlugin::<TerrainMaterial>::default(),
         MaterialPlugin::<WaterMaterial>::default(),
         MaterialPlugin::<UrbanMaterial>::default(),
+        hud::HudPlugin,
     ))
     .insert_resource(ClearColor(srgb(nature::HORIZON_COLOR)))
     .insert_resource(Sim::new(world))
@@ -169,10 +178,9 @@ fn srgb(c: [f32; 3]) -> Color {
     Color::srgb(c[0], c[1], c[2])
 }
 
-/// Textes de l'interface dans la langue choisie (le HUD les lira).
+/// Textes de l'interface dans la langue choisie.
 #[derive(Resource, Debug)]
-#[allow(dead_code)]
-struct Texts(city_i18n::Localizer);
+pub(crate) struct Texts(city_i18n::Localizer);
 
 impl std::ops::Deref for Texts {
     type Target = city_i18n::Localizer;
@@ -183,9 +191,13 @@ impl std::ops::Deref for Texts {
 
 /// État de simulation possédé par la couche de présentation.
 #[derive(Resource)]
-struct Sim {
-    world: World,
+pub(crate) struct Sim {
+    pub(crate) world: World,
     clock: FixedStepClock,
+    /// Vitesse du temps : 0 = pause, 1 = normale, 2 = ×2, 3 = ×4.
+    pub(crate) speed: u8,
+    /// Vitesse à reprendre après une pause.
+    pub(crate) resume_speed: u8,
 }
 
 impl Sim {
@@ -193,6 +205,8 @@ impl Sim {
         Self {
             world,
             clock: FixedStepClock::from_hz(20),
+            speed: 1,
+            resume_speed: 1,
         }
     }
 
@@ -232,8 +246,9 @@ struct City {
     chunks: HashMap<(u32, u32), CityChunk>,
 }
 
-/// Empreinte des bâtiments d'un morceau, et son entité si elle a de la géométrie.
-type CityChunk = (u64, Option<(Entity, Handle<Mesh>)>);
+/// Empreintes (visuelle, occupation) d'un morceau, et son entité si elle a
+/// de la géométrie.
+type CityChunk = (u64, u64, Option<(Entity, Handle<Mesh>)>);
 
 impl City {
     /// Reconstruit la voirie si le réseau a changé, puis les morceaux dont les
@@ -273,34 +288,40 @@ impl City {
         for cy in (0..h).step_by(CITY_CHUNK_TILES as usize) {
             for cx in (0..w).step_by(CITY_CHUNK_TILES as usize) {
                 // Une tuile de marge : la parcelle dépend des voisines.
-                let signature = urban::buildings_signature(
+                let (signature, occupancy) = urban::buildings_signature(
                     world,
                     cx.saturating_sub(1),
                     cy.saturating_sub(1),
                     cx + CITY_CHUNK_TILES + 1,
                     cy + CITY_CHUNK_TILES + 1,
                 );
-                let entry = self.chunks.entry((cx, cy)).or_insert((u64::MAX, None));
+                let entry = self.chunks.entry((cx, cy)).or_insert((u64::MAX, u64::MAX, None));
                 if entry.0 == signature && !roads_changed {
                     continue;
                 }
                 // Budget par passage : les chantiers font évoluer beaucoup de
                 // morceaux à la fois ; le reste attend le passage suivant
                 // (sauf au premier passage et quand la voirie change).
-                if rebuilt >= CITY_REBUILD_BUDGET && entry.1.is_some() && !roads_changed {
+                if rebuilt >= CITY_REBUILD_BUDGET && entry.2.is_some() && !roads_changed {
                     continue;
                 }
                 rebuilt += 1;
                 entry.0 = signature;
-                // Marge d'une tuile : les arbres voisins dépendent des parcelles.
-                changed.push([
+                // Arbres : seulement si un bâtiment est apparu ou a disparu
+                // (pas à chaque palier de chantier). Marge d'une tuile : les
+                // arbres voisins dépendent des parcelles.
+                let occupancy_changed = entry.1 != occupancy || roads_changed;
+                entry.1 = occupancy;
+                if occupancy_changed {
+                    changed.push([
                     cx as f32 * size - size,
                     cy as f32 * size - size,
                     (cx + CITY_CHUNK_TILES) as f32 * size + size,
                     (cy + CITY_CHUNK_TILES) as f32 * size + size,
-                ]);
+                    ]);
+                }
                 let data = urban::buildings_in(world, &self.roads, cx, cy, cx + CITY_CHUNK_TILES, cy + CITY_CHUNK_TILES);
-                if let Some((entity, handle)) = entry.1.take() {
+                if let Some((entity, handle)) = entry.2.take() {
                     commands.entity(entity).despawn();
                     meshes.remove(&handle);
                 }
@@ -311,11 +332,16 @@ impl City {
                 let entity = commands
                     .spawn((Mesh3d(handle.clone()), MeshMaterial3d(handles.urban.clone()), Transform::default()))
                     .id();
-                entry.1 = Some((entity, handle));
+                entry.2 = Some((entity, handle));
             }
         }
         changed
     }
+}
+
+/// Maillage modifiable (fantômes de construction du HUD).
+pub(crate) fn urban_mesh_public(data: urban::UrbanMesh) -> Mesh {
+    urban_mesh(data, RenderAssetUsages::default())
 }
 
 fn urban_mesh(data: urban::UrbanMesh, usage: RenderAssetUsages) -> Mesh {
@@ -383,7 +409,7 @@ impl ForestCell {
 
 /// Caméra orbitale amortie et bornée.
 #[derive(Component, Debug)]
-struct OrbitCamera {
+pub(crate) struct OrbitCamera {
     focus: Vec3,
     yaw: f32,
     pitch: f32,
@@ -394,6 +420,20 @@ struct OrbitCamera {
     target_pitch: f32,
     target_distance: f32,
     bounds: nature::CameraBounds,
+}
+
+impl OrbitCamera {
+    /// Saut immédiat vers un point de vue (tour, tests scriptés).
+    pub(crate) fn look_at(&mut self, focus: Vec3, yaw: f32, pitch: f32, distance: f32) {
+        self.target_focus = focus;
+        self.target_yaw = yaw;
+        self.target_pitch = pitch;
+        self.target_distance = distance;
+        self.focus = focus;
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self.distance = distance;
+    }
 }
 
 #[derive(Component)]
@@ -790,10 +830,31 @@ fn setup(
     ));
 }
 
-fn step_simulation(time: Res<Time>, mut sim: ResMut<Sim>) {
-    let batch = sim.clock.advance(time.delta());
+/// Avance la simulation au rythme choisi et publie les événements notables
+/// dans le fil d'actualité (textes traduits).
+fn step_simulation(time: Res<Time>, mut sim: ResMut<Sim>, texts: Res<Texts>, mut feed: ResMut<hud::Feed>) {
+    let factor = match sim.speed {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    };
+    let batch = sim.clock.advance(time.delta() * factor);
     for _ in 0..batch.ticks {
-        sim.world.tick();
+        let report = sim.world.tick();
+        let month = sim.world.snapshot().month;
+        for event in &report.events {
+            use sim_core::SimEvent as E;
+            let notable = matches!(
+                event,
+                E::CommandRejected { .. } | E::RoadsOpened { .. } | E::RoundaboutBuilt { .. } | E::BudgetSettled { .. } | E::RoadsRemoved { .. }
+            );
+            if notable {
+                if let Some(message) = city_ui::text::event(&texts, event, month as u32) {
+                    feed.push(message, matches!(event, E::CommandRejected { .. }));
+                }
+            }
+        }
     }
 }
 
@@ -806,6 +867,8 @@ fn camera_controls(
     time: Res<Time>,
     sim: Res<Sim>,
     tour: Res<Tour>,
+    tools: Res<hud::Tools>,
+    over_hud: Res<hud::PointerOverHud>,
     mut query: Query<(&mut Transform, &mut OrbitCamera)>,
 ) {
     let dt = time.delta_secs().min(0.1);
@@ -832,8 +895,10 @@ fn camera_controls(
             if keys.pressed(KeyCode::KeyX) || keys.pressed(KeyCode::Minus) {
                 zoom *= 1.0 + 1.6 * dt;
             }
-            // Molette : un cran = 12 %.
-            zoom *= 0.88f32.powf(scroll.delta.y);
+            // Molette : un cran = 12 % (pas au-dessus des panneaux).
+            if !over_hud.0 {
+                zoom *= 0.88f32.powf(scroll.delta.y);
+            }
             camera.target_distance *= zoom;
 
             let forward = Vec3::new(-camera.target_yaw.sin(), 0.0, -camera.target_yaw.cos());
@@ -858,7 +923,9 @@ fn camera_controls(
                 camera.target_yaw -= delta.x * 0.005;
                 camera.target_pitch += delta.y * 0.004;
             }
-            if buttons.pressed(MouseButton::Middle) || buttons.pressed(MouseButton::Left) {
+            // Clic gauche : aux outils, sauf sans outil (il déplace alors la vue).
+            let left_pans = tools.controller.tool == city_ui::tools::Tool::Select && !over_hud.0;
+            if buttons.pressed(MouseButton::Middle) || (left_pans && buttons.pressed(MouseButton::Left)) {
                 // Glisser = attraper le sol : le déplacement suit la souris,
                 // proportionnel à la distance.
                 let scale = camera.target_distance * 0.0016;
@@ -1179,7 +1246,7 @@ fn auto_screenshot(
     mut done: Local<bool>,
     time: Res<Time>,
 ) {
-    if *done || tour.active {
+    if *done || tour.active || std::env::var_os("CITYMAYOR_TOOLTEST").is_some() {
         return;
     }
     *elapsed += time.delta_secs();
