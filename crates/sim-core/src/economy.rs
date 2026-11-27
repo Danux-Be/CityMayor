@@ -34,6 +34,39 @@ impl Default for BudgetParams {
 }
 
 /// Résultat d'un règlement mensuel (poussé dans les événements de tick).
+/// Taux d'imposition « neutre » (%) : celui pour lequel les recettes de base
+/// (`tax_per_*_cents`) s'appliquent telles quelles et la demande n'est ni
+/// freinée ni stimulée.
+pub const NEUTRAL_TAX_PERCENT: u8 = 9;
+/// Taux maximal autorisé (%).
+pub const MAX_TAX_PERCENT: u8 = 25;
+
+/// Détail d'un budget mensuel (réel ou estimé), en centimes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BudgetBreakdown {
+    pub residential_tax_cents: i64,
+    pub business_tax_cents: i64,
+    pub road_upkeep_cents: i64,
+    pub building_upkeep_cents: i64,
+}
+
+impl BudgetBreakdown {
+    #[must_use]
+    pub const fn income_cents(&self) -> i64 {
+        self.residential_tax_cents.saturating_add(self.business_tax_cents)
+    }
+
+    #[must_use]
+    pub const fn expenses_cents(&self) -> i64 {
+        self.road_upkeep_cents.saturating_add(self.building_upkeep_cents)
+    }
+
+    #[must_use]
+    pub const fn net_cents(&self) -> i64 {
+        self.income_cents().saturating_sub(self.expenses_cents())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BudgetReport {
     pub income_cents: i64,
@@ -48,6 +81,10 @@ pub struct Treasury {
     pub last_income_cents: i64,
     pub last_expenses_cents: i64,
     pub month_count: u32,
+    /// Taux d'imposition (%) : habitants, puis entreprises (emplois).
+    pub tax_percent: [u8; 2],
+    /// Détail du dernier mois réglé.
+    pub last_breakdown: BudgetBreakdown,
 }
 
 impl Treasury {
@@ -58,6 +95,28 @@ impl Treasury {
             last_income_cents: 0,
             last_expenses_cents: 0,
             month_count: 0,
+            tax_percent: [NEUTRAL_TAX_PERCENT; 2],
+            last_breakdown: BudgetBreakdown::default(),
+        }
+    }
+
+    /// Fixe les taux (bornés à `MAX_TAX_PERCENT`).
+    pub fn set_tax_percent(&mut self, residential: u8, business: u8) {
+        self.tax_percent = [residential.min(MAX_TAX_PERCENT), business.min(MAX_TAX_PERCENT)];
+    }
+
+    /// Budget d'un mois avec la ville telle qu'elle est (estimation affichée
+    /// en continu, et base du règlement mensuel).
+    #[must_use]
+    pub fn estimate(&self, census: &Census, road_segments: u32, buildings: u32, params: &BudgetParams) -> BudgetBreakdown {
+        let scaled = |base: i64, count: u32, percent: u8| {
+            i64::from(count).saturating_mul(base).saturating_mul(i64::from(percent)) / i64::from(NEUTRAL_TAX_PERCENT)
+        };
+        BudgetBreakdown {
+            residential_tax_cents: scaled(params.tax_per_resident_cents, census.population, self.tax_percent[0]),
+            business_tax_cents: scaled(params.tax_per_job_cents, census.employed, self.tax_percent[1]),
+            road_upkeep_cents: i64::from(road_segments).saturating_mul(params.upkeep_per_segment_cents),
+            building_upkeep_cents: i64::from(buildings).saturating_mul(params.upkeep_per_building_cents),
         }
     }
 
@@ -74,13 +133,9 @@ impl Treasury {
         buildings: u32,
         params: &BudgetParams,
     ) -> BudgetReport {
-        let income = i64::from(census.population)
-            .saturating_mul(params.tax_per_resident_cents)
-            .saturating_add(i64::from(census.employed).saturating_mul(params.tax_per_job_cents));
-        let expenses = i64::from(road_segments)
-            .saturating_mul(params.upkeep_per_segment_cents)
-            .saturating_add(i64::from(buildings).saturating_mul(params.upkeep_per_building_cents));
-        let net = income.saturating_sub(expenses);
+        let breakdown = self.estimate(census, road_segments, buildings, params);
+        let (income, expenses, net) = (breakdown.income_cents(), breakdown.expenses_cents(), breakdown.net_cents());
+        self.last_breakdown = breakdown;
 
         self.funds_cents = self.funds_cents.saturating_add(net);
         self.last_income_cents = income;
@@ -115,6 +170,20 @@ mod tests {
         assert_eq!(report.net_cents, report.income_cents - report.expenses_cents);
         assert_eq!(treasury.funds_cents, params.start_funds_cents + report.net_cents);
         assert_eq!(treasury.month_count, 1);
+    }
+
+    #[test]
+    fn tax_rates_scale_income_linearly() {
+        let params = BudgetParams::default();
+        let census = Census { population: 100, employed: 40, ..Census::default() };
+        let mut treasury = Treasury::new(&params);
+        let neutral = treasury.estimate(&census, 0, 0, &params);
+        treasury.set_tax_percent(18, 0);
+        let doubled = treasury.estimate(&census, 0, 0, &params);
+        assert_eq!(doubled.residential_tax_cents, neutral.residential_tax_cents * 2);
+        assert_eq!(doubled.business_tax_cents, 0);
+        treasury.set_tax_percent(200, 200);
+        assert_eq!(treasury.tax_percent, [MAX_TAX_PERCENT; 2]);
     }
 
     #[test]

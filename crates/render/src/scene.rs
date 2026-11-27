@@ -173,6 +173,73 @@ pub fn demo_city() -> World {
     world
 }
 
+/// Carte vierge d'une nouvelle partie : le relief généré (collines,
+/// fleuve, lacs, forêts, montagnes), sans zone ni bâtiment. Seule une
+/// entrée d'autoroute arrive de l'ouest et se prolonge par une courte rue :
+/// c'est le raccordement au reste du pays, d'où le joueur trace sa ville.
+/// Les routes du joueur passent ensuite par un chantier.
+#[must_use]
+pub fn blank_map() -> World {
+    let config = SimConfig { road_access_radius_tiles: 3, road_construction: false, ..SimConfig::default() };
+    let mut world = World::generated(config, 0x0C17_CAFE, WorldGenParams::default(), DEMO_MAP_TILES, DEMO_MAP_TILES);
+    let max_slope = world.config().max_slope_cm;
+    let dry = |world: &World, x: u32, y: u32| {
+        world.zoning().grid().tile_at(x, y).is_some_and(|tile| world.terrain().is_buildable(tile, max_slope))
+    };
+    let at = |x: u32, y: u32| Point::new(tile_center_m(x as i32), tile_center_m(y as i32));
+    // Premier tronçon sec de la rangée de l'autoroute, depuis le bord ouest.
+    let hy = DEMO_HIGHWAY_ROW;
+    let x0 = (2..DEMO_MAP_TILES / 2).find(|&x| dry(&world, x, hy)).unwrap_or(2);
+    let mut xe = x0;
+    while xe < x0 + 70 && dry(&world, xe + 1, hy) {
+        xe += 1;
+    }
+    world.queue(Command::BuildRoad { from: at(x0, hy), to: at(xe, hy), spec: RoadSpec::HIGHWAY });
+    // Bretelle de sortie : une rue vers le sud, sur la terre ferme.
+    let mut ye = hy;
+    while ye < hy + 18 && dry(&world, xe, ye + 1) {
+        ye += 1;
+    }
+    if ye > hy + 3 {
+        world.queue(Command::BuildRoad { from: at(xe, hy), to: at(xe, ye), spec: RoadSpec::TWO_WAY });
+    }
+    world.queue(Command::SetRoadConstruction { enabled: true });
+    world
+}
+
+/// Point de départ de la caméra : le bout de la route de départ sur une
+/// carte vierge, le centre de la carte sinon.
+#[must_use]
+pub fn start_focus(world: &World) -> [f32; 3] {
+    let roads = world.roads();
+    if world.buildings().live_count() == 0 && roads.live_segments() > 0 && roads.live_segments() <= 4 {
+        if let Some((_, seg)) = roads.segments().last() {
+            if let Some(node) = roads.node(seg.b) {
+                let (x, z) = (node.pos.x.to_f32(), node.pos.y.to_f32());
+                return [x, altitude_at(world, x, z), z];
+            }
+        }
+    }
+    map_center(world)
+}
+
+/// Petit pâté de maisons pour les tests d'outils : carte de 64 × 64 tuiles
+/// (512 m), deux rues, un îlot zoné, et de la place libre au sud.
+#[must_use]
+pub fn small_block() -> World {
+    let config = SimConfig { road_access_radius_tiles: 3, road_construction: false, ..SimConfig::default() };
+    // Sans fleuve : le pâté et la place libre autour restent au sec.
+    let params = WorldGenParams { river: None, ..WorldGenParams::default() };
+    let mut world = World::generated(config, 0x0C17_CAFE, params, 64, 64);
+    let at = |x: i32, y: i32| Point::new(tile_center_m(x), tile_center_m(y));
+    for (from, to) in [((8, 20), (56, 20)), ((8, 20), (8, 32)), ((56, 20), (56, 32))] {
+        world.queue(Command::BuildRoad { from: at(from.0, from.1), to: at(to.0, to.1), spec: RoadSpec::TWO_WAY });
+    }
+    world.queue(Command::ZoneRect { rect: Rect::new(10, 22, 54, 23), zone: ZoneType::Residential });
+    world.queue(Command::ZoneRect { rect: Rect::new(10, 17, 54, 18), zone: ZoneType::Commercial });
+    world
+}
+
 /// Rangée (tuiles) de l'autoroute de la démo.
 pub const DEMO_HIGHWAY_ROW: u32 = 9;
 /// Rayon de l'anneau du rond-point de la démo (m).
@@ -183,7 +250,7 @@ const DEMO_HIGHWAY_WORKS_TILES: u32 = 36;
 /// Ouvre le chantier de la démo : le dernier tronçon de l'autoroute, avec
 /// la durée de travaux normale (la route ouvrira en cours de partie).
 pub fn demo_road_works(world: &mut World) {
-    world.set_road_construction(true);
+    world.queue(Command::SetRoadConstruction { enabled: true });
     let hy = DEMO_HIGHWAY_ROW;
     let at = |x: u32| Point::new(tile_center_m(x as i32), tile_center_m(hy as i32));
     // Extrémité est actuelle de l'autoroute : le nœud le plus à l'est sur sa rangée.
@@ -460,6 +527,37 @@ pub fn block_is_sane(block: &BuildingBlock) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_map_has_only_the_highway_entry() {
+        let mut world = blank_map();
+        for _ in 0..3 {
+            world.tick();
+        }
+        let roads = world.roads();
+        assert_eq!(roads.live_segments(), 2, "autoroute d'entrée + rue de départ");
+        assert!(roads.segments().any(|(_, s)| s.spec == RoadSpec::HIGHWAY));
+        // Livrées ouvertes ; les routes du joueur, elles, passeront par un chantier.
+        let now = world.current_tick();
+        assert!(roads.segments().all(|(_, s)| s.is_open(now)));
+        assert!(world.config().road_construction);
+        assert_eq!(world.zoning().count(ZoneType::Residential), 0);
+        assert_eq!(world.buildings().live_count(), 0);
+        // La caméra démarre au bout de la rue, sur la carte.
+        let focus = start_focus(&world);
+        assert_ne!(focus, map_center(&world));
+        assert!(focus[0] > 0.0 && focus[2] > 0.0);
+    }
+
+    #[test]
+    fn small_block_is_dry_land_with_room_to_build() {
+        let world = small_block();
+        let max_slope = world.config().max_slope_cm;
+        let grid = world.zoning().grid();
+        let dry = (12..52).flat_map(|y| (6..58).map(move |x| (x, y)));
+        let wet: Vec<_> = dry.filter(|&(x, y)| !grid.tile_at(x, y).is_some_and(|t| world.terrain().is_buildable(t, max_slope))).collect();
+        assert!(wet.len() < 40, "{} tuiles non constructibles", wet.len());
+    }
 
     #[test]
     fn demo_city_builds_on_both_banks_with_a_curved_boulevard() {

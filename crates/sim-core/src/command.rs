@@ -14,7 +14,7 @@
 //! comprend immédiatement pourquoi c'est rouge.
 
 use crate::fixed::Fixed;
-use crate::ids::TileId;
+use crate::ids::{SegmentId, TileId};
 use crate::road::{Point, RoadError, RoadSpec};
 use crate::zoning::ZoneType;
 
@@ -108,6 +108,15 @@ pub enum Command {
         radius_m: Fixed,
         spec: RoadSpec,
     },
+    /// Démolit un segment de route. Un arc de rond-point emporte tout
+    /// l'anneau (un rond-point ouvert n'a pas de sens).
+    BulldozeRoad { segment: SegmentId },
+    /// Taux d'imposition (%) des habitants et des entreprises, bornés à
+    /// `economy::MAX_TAX_PERCENT`.
+    SetTaxes { residential_percent: u8, business_percent: u8 },
+    /// Active ou coupe les chantiers routiers pour les routes tracées
+    /// ensuite (scénarios : réseau initial livré ouvert, puis chantiers).
+    SetRoadConstruction { enabled: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

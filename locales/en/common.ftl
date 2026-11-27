@@ -4,8 +4,15 @@
 app-title = CityMayor
 app-tagline = Build, zone and govern a living city.
 
+## Numbers
+
+# Séparateur des milliers (en anglais : 1,250,000).
+number-group-separator = ,
+
 ## Units
 
+# `$formatted` : le nombre déjà mis en forme (séparateur de milliers) ;
+# `$count` : la valeur, pour choisir le pluriel.
 unit-meters = { $value } m
 unit-kilometers = { $value } km
 unit-money = ${ $value }
@@ -15,8 +22,8 @@ unit-money-signed = { $value ->
 }
 unit-percent = { $value }%
 unit-inhabitants = { $count ->
-    [one] { $count } inhabitant
-   *[other] { $count } inhabitants
+    [one] { $formatted } inhabitant
+   *[other] { $formatted } inhabitants
 }
 unit-jobs = { $count ->
     [one] { $count } job

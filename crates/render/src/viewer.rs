@@ -46,14 +46,29 @@ use sim_core::{FixedStepClock, World, ZoneType};
 
 use std::collections::HashMap;
 
-use crate::{nature, roads, scene, urban};
+use crate::{hud, nature, roads, scene, screens, urban};
 
 /// Ticks simulés avant d'ouvrir la fenêtre : la ville est déjà peuplée.
-const PRESIMULATION_TICKS: u32 = 2_400;
+const PRESIMULATION_TICKS: u64 = crate::session::NEW_GAME_TICKS;
 
 type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
 type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
 type UrbanMaterial = ExtendedMaterial<StandardMaterial, UrbanExtension>;
+type TreeMaterial = ExtendedMaterial<StandardMaterial, TreeExtension>;
+
+/// Feuillage : matériau standard (atlas détouré par l'alpha), mais **hors
+/// pré-passe de profondeur**. Les transitions entre niveaux de détail se
+/// font par tramage (`VisibilityRange`), appliqué en passe principale mais
+/// pas en pré-passe : un arbre effacé par le tramage y écrivait quand même
+/// sa profondeur, et le ciel apparaissait au travers.
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
+struct TreeExtension {}
+
+impl MaterialExtension for TreeExtension {
+    fn enable_prepass() -> bool {
+        false
+    }
+}
 
 /// Extension du matériau standard : six couches de sol dans un tableau de
 /// textures, mélangées par `shaders/terrain.wesl`.
@@ -104,16 +119,24 @@ impl MaterialExtension for UrbanExtension {
 }
 
 /// Lancée par le binaire `city-viewer`.
+///
+/// Déroulé : écran du studio → menu principal → chargement → partie
+/// (`screens`). Les tours de captures (`CITYMAYOR_TOUR`), le test des
+/// outils (`CITYMAYOR_TOOLTEST`) et `CITYMAYOR_NEWGAME` (nouvelle partie
+/// sur carte vierge) vont droit au chargement.
 pub fn run() {
-    let mut world = scene::demo_city();
-    for tick in 0..PRESIMULATION_TICKS {
-        // À mi-parcours : un chantier d'autoroute, encore en cours à l'ouverture.
-        if tick == PRESIMULATION_TICKS / 2 {
-            scene::demo_road_works(&mut world);
-        }
-        world.tick();
-    }
-    let tour = Tour::new(std::env::var_os("CITYMAYOR_TOUR").is_some(), &world);
+    let tool_test = std::env::var_os("CITYMAYOR_TOOLTEST").is_some();
+    let tour = std::env::var_os("CITYMAYOR_TOUR").is_some();
+    let (start, request) = if tool_test {
+        (screens::AppState::Loading, Some(screens::LoadRequest::New { scenario: "block".into(), ticks: 1_500 }))
+    } else if std::env::var_os("CITYMAYOR_NEWGAME").is_some() {
+        // Raccourci de développement : nouvelle partie sans passer par le menu.
+        (screens::AppState::Loading, Some(screens::LoadRequest::New { scenario: "blank".into(), ticks: 2 }))
+    } else if tour {
+        (screens::AppState::Loading, Some(screens::LoadRequest::New { scenario: "demo".into(), ticks: PRESIMULATION_TICKS }))
+    } else {
+        (screens::AppState::Splash, None)
+    };
 
     // Langue de l'interface : anglais pour l'instant (fichiers `locales/`).
     let texts = city_i18n::Localizer::english();
@@ -129,19 +152,22 @@ pub fn run() {
     embedded_asset!(app, "shaders/terrain.wesl");
     embedded_asset!(app, "shaders/water.wesl");
     embedded_asset!(app, "shaders/urban.wesl");
-    app.add_plugins((
+    app.insert_resource(Texts(texts)).add_plugins((
         MaterialPlugin::<TerrainMaterial>::default(),
         MaterialPlugin::<WaterMaterial>::default(),
         MaterialPlugin::<UrbanMaterial>::default(),
+        MaterialPlugin::<TreeMaterial>::default(),
+        screens::ScreensPlugin { start, request },
+        hud::HudPlugin,
     ))
-    .insert_resource(ClearColor(srgb(nature::HORIZON_COLOR)))
-    .insert_resource(Sim::new(world))
-    .insert_resource(Texts(texts))
+    .insert_resource(ClearColor(Color::BLACK))
     .insert_resource(Handles::default())
     .insert_resource(City::default())
-    .insert_resource(tour)
+    .insert_resource(Tour::inactive())
+    .init_resource::<Graphics>()
     // `ScreenshotPlugin` est déjà fourni par `DefaultPlugins` en Bevy 0.20.
-    .add_systems(Startup, setup)
+    // La scène se construit à la fin du chargement (`screens::BuildScene`).
+    .add_systems(Update, setup.run_if(resource_exists::<screens::BuildScene>))
     .add_systems(
         Update,
         (
@@ -154,9 +180,40 @@ pub fn run() {
             stream_forest,
             (auto_screenshot, screenshot_on_key).chain(),
         )
-            .chain(),
+            .chain()
+            .run_if(in_state(screens::AppState::InGame)),
     )
-    .run();
+    .add_systems(Update, apply_graphics.run_if(in_state(screens::AppState::InGame)).run_if(resource_changed::<Graphics>))
+    ;
+    if std::env::var_os("CITYMAYOR_FPS").is_some() {
+        app.add_systems(Update, fps_probe.run_if(in_state(screens::AppState::InGame)));
+    }
+    app.run();
+}
+
+/// Mesure de performance (`CITYMAYOR_FPS=1`) : images par seconde et temps
+/// moyen par image, toutes les 3 s, et sortie après `CITYMAYOR_FPS_EXIT_S`.
+fn fps_probe(time: Res<Time>, mut acc: Local<(f32, u32, f32)>, mut exit: MessageWriter<AppExit>) {
+    acc.0 += time.delta_secs();
+    acc.1 += 1;
+    acc.2 += time.delta_secs();
+    if acc.0 >= 3.0 {
+        println!("fps : {:.1} i/s ({:.1} ms/image)", acc.1 as f32 / acc.0, acc.0 * 1000.0 / acc.1 as f32);
+        *acc = (0.0, 0, acc.2);
+    }
+    let limit: f32 = std::env::var("CITYMAYOR_FPS_EXIT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(f32::MAX);
+    if acc.2 > limit {
+        exit.write(AppExit::Success);
+    }
+}
+
+/// Ressources de la partie remises à neuf au retour au menu principal.
+pub(crate) fn reset_game_resources(commands: &mut Commands) {
+    commands.insert_resource(Handles::default());
+    commands.insert_resource(City::default());
+    commands.insert_resource(Tour::inactive());
+    commands.remove_resource::<Forest>();
+    commands.insert_resource(ClearColor(Color::BLACK));
 }
 
 /// Diagnostic de performance : `CITYMAYOR_DISABLE=arbres,ombres,eau,sol,msaa`
@@ -169,10 +226,9 @@ fn srgb(c: [f32; 3]) -> Color {
     Color::srgb(c[0], c[1], c[2])
 }
 
-/// Textes de l'interface dans la langue choisie (le HUD les lira).
+/// Textes de l'interface dans la langue choisie.
 #[derive(Resource, Debug)]
-#[allow(dead_code)]
-struct Texts(city_i18n::Localizer);
+pub(crate) struct Texts(city_i18n::Localizer);
 
 impl std::ops::Deref for Texts {
     type Target = city_i18n::Localizer;
@@ -183,16 +239,22 @@ impl std::ops::Deref for Texts {
 
 /// État de simulation possédé par la couche de présentation.
 #[derive(Resource)]
-struct Sim {
-    world: World,
+pub(crate) struct Sim {
+    pub(crate) world: World,
     clock: FixedStepClock,
+    /// Vitesse du temps : 0 = pause, 1 = normale, 2 = ×2, 3 = ×4.
+    pub(crate) speed: u8,
+    /// Vitesse à reprendre après une pause.
+    pub(crate) resume_speed: u8,
 }
 
 impl Sim {
-    fn new(world: World) -> Self {
+    pub(crate) fn new(world: World) -> Self {
         Self {
             world,
             clock: FixedStepClock::from_hz(20),
+            speed: 1,
+            resume_speed: 1,
         }
     }
 
@@ -232,8 +294,9 @@ struct City {
     chunks: HashMap<(u32, u32), CityChunk>,
 }
 
-/// Empreinte des bâtiments d'un morceau, et son entité si elle a de la géométrie.
-type CityChunk = (u64, Option<(Entity, Handle<Mesh>)>);
+/// Empreintes (visuelle, occupation) d'un morceau, et son entité si elle a
+/// de la géométrie.
+type CityChunk = (u64, u64, Option<(Entity, Handle<Mesh>)>);
 
 impl City {
     /// Reconstruit la voirie si le réseau a changé, puis les morceaux dont les
@@ -273,34 +336,40 @@ impl City {
         for cy in (0..h).step_by(CITY_CHUNK_TILES as usize) {
             for cx in (0..w).step_by(CITY_CHUNK_TILES as usize) {
                 // Une tuile de marge : la parcelle dépend des voisines.
-                let signature = urban::buildings_signature(
+                let (signature, occupancy) = urban::buildings_signature(
                     world,
                     cx.saturating_sub(1),
                     cy.saturating_sub(1),
                     cx + CITY_CHUNK_TILES + 1,
                     cy + CITY_CHUNK_TILES + 1,
                 );
-                let entry = self.chunks.entry((cx, cy)).or_insert((u64::MAX, None));
+                let entry = self.chunks.entry((cx, cy)).or_insert((u64::MAX, u64::MAX, None));
                 if entry.0 == signature && !roads_changed {
                     continue;
                 }
                 // Budget par passage : les chantiers font évoluer beaucoup de
                 // morceaux à la fois ; le reste attend le passage suivant
                 // (sauf au premier passage et quand la voirie change).
-                if rebuilt >= CITY_REBUILD_BUDGET && entry.1.is_some() && !roads_changed {
+                if rebuilt >= CITY_REBUILD_BUDGET && entry.2.is_some() && !roads_changed {
                     continue;
                 }
                 rebuilt += 1;
                 entry.0 = signature;
-                // Marge d'une tuile : les arbres voisins dépendent des parcelles.
-                changed.push([
+                // Arbres : seulement si un bâtiment est apparu ou a disparu
+                // (pas à chaque palier de chantier). Marge d'une tuile : les
+                // arbres voisins dépendent des parcelles.
+                let occupancy_changed = entry.1 != occupancy || roads_changed;
+                entry.1 = occupancy;
+                if occupancy_changed {
+                    changed.push([
                     cx as f32 * size - size,
                     cy as f32 * size - size,
                     (cx + CITY_CHUNK_TILES) as f32 * size + size,
                     (cy + CITY_CHUNK_TILES) as f32 * size + size,
-                ]);
+                    ]);
+                }
                 let data = urban::buildings_in(world, &self.roads, cx, cy, cx + CITY_CHUNK_TILES, cy + CITY_CHUNK_TILES);
-                if let Some((entity, handle)) = entry.1.take() {
+                if let Some((entity, handle)) = entry.2.take() {
                     commands.entity(entity).despawn();
                     meshes.remove(&handle);
                 }
@@ -311,11 +380,16 @@ impl City {
                 let entity = commands
                     .spawn((Mesh3d(handle.clone()), MeshMaterial3d(handles.urban.clone()), Transform::default()))
                     .id();
-                entry.1 = Some((entity, handle));
+                entry.2 = Some((entity, handle));
             }
         }
         changed
     }
+}
+
+/// Maillage modifiable (fantômes de construction du HUD).
+pub(crate) fn urban_mesh_public(data: urban::UrbanMesh) -> Mesh {
+    urban_mesh(data, RenderAssetUsages::default())
 }
 
 fn urban_mesh(data: urban::UrbanMesh, usage: RenderAssetUsages) -> Mesh {
@@ -325,27 +399,116 @@ fn urban_mesh(data: urban::UrbanMesh, usage: RenderAssetUsages) -> Mesh {
 /// Niveaux construits à la demande près de la caméra (`stream_forest`).
 const STREAMED_LODS: [nature::TreeLod; 2] = [nature::TreeLod::Model, nature::TreeLod::Reduced];
 
+/// Préréglage graphique en vigueur (réglages + carte graphique).
+#[derive(Resource, Clone, Copy, Debug)]
+pub(crate) struct Graphics(pub(crate) crate::session::GraphicsProfile);
+
+impl Default for Graphics {
+    fn default() -> Self {
+        Self(crate::session::GraphicsProfile::of(crate::session::Quality::High))
+    }
+}
+
+/// Niveau de détail d'une entité d'arbres (pour réappliquer un préréglage).
+#[derive(Component, Clone, Copy, Debug)]
+struct TreeLevel(nature::TreeLod);
+
 /// Plage de visibilité (mètres caméra → origine de la cellule) d'un niveau.
-fn tree_lod_range(lod: nature::TreeLod) -> VisibilityRange {
-    let ((s0, s1), (e0, e1)) = nature::tree_lod_distances(lod);
+fn tree_lod_range(lod: nature::TreeLod, detail: nature::TreeDetail) -> VisibilityRange {
+    let ((s0, s1), (e0, e1)) = nature::tree_lod_distances_scaled(lod, detail);
     VisibilityRange { start_margin: s0..s1, end_margin: e0..e1, use_aabb: false }
+}
+
+/// Un niveau d'arbres porte-t-il une ombre avec ce préréglage ? Le modèle
+/// complet toujours (s'il y a des ombres), l'allégé en Ultra seulement, la
+/// silhouette jamais.
+fn tree_casts_shadow(lod: nature::TreeLod, graphics: &Graphics) -> bool {
+    match lod {
+        nature::TreeLod::Model => true,
+        nature::TreeLod::Reduced => graphics.0.distant_tree_shadows,
+        nature::TreeLod::Silhouette => false,
+    }
+}
+
+fn tree_detail(graphics: &Graphics) -> nature::TreeDetail {
+    nature::TreeDetail { model: graphics.0.tree_detail, reduced: graphics.0.reduced_tree_detail }
+}
+
+fn cascade_config(shadow: crate::session::ShadowProfile) -> bevy::light::CascadeShadowConfig {
+    CascadeShadowConfigBuilder {
+        num_cascades: shadow.cascades,
+        first_cascade_far_bound: shadow.first_far_m,
+        maximum_distance: shadow.max_m,
+        ..default()
+    }
+    .build()
+}
+
+fn msaa_of(graphics: &Graphics) -> Msaa {
+    if disabled("msaa") {
+        return Msaa::Off;
+    }
+    match graphics.0.msaa {
+        0 | 1 => Msaa::Off,
+        2 => Msaa::Sample2,
+        _ => Msaa::Sample4,
+    }
+}
+
+/// Réapplique le préréglage graphique à la scène en cours (changement de
+/// réglage pendant la partie, ou fin de chargement).
+#[allow(clippy::too_many_arguments)]
+fn apply_graphics(
+    mut commands: Commands,
+    graphics: Res<Graphics>,
+    mut lights: Query<(Entity, &mut DirectionalLight)>,
+    mut cameras: Query<&mut Msaa, With<Camera3d>>,
+    mut terrains: ResMut<Assets<TerrainMaterial>>,
+    trees: Query<(Entity, &TreeLevel)>,
+) {
+    let profile = graphics.0;
+    for (entity, mut light) in &mut lights {
+        light.shadow_maps_enabled = profile.shadows.is_some() && !disabled("ombres");
+        if let Some(shadow) = profile.shadows {
+            commands.entity(entity).insert(cascade_config(shadow));
+        }
+    }
+    if let Some(shadow) = profile.shadows {
+        commands.insert_resource(bevy::light::DirectionalLightShadowMap { size: shadow.map_size });
+    }
+    for mut msaa in &mut cameras {
+        *msaa = msaa_of(&graphics);
+    }
+    for (_, material) in terrains.iter_mut() {
+        material.extension.scales_b.z = profile.terrain_detail;
+    }
+    for (entity, level) in &trees {
+        let mut e = commands.entity(entity);
+        e.insert(tree_lod_range(level.0, tree_detail(&graphics)));
+        if tree_casts_shadow(level.0, &graphics) {
+            e.remove::<bevy::light::NotShadowCaster>();
+        } else {
+            e.insert(bevy::light::NotShadowCaster);
+        }
+    }
 }
 
 fn spawn_tree_entity(
     commands: &mut Commands,
     mesh: Handle<Mesh>,
-    material: &Handle<StandardMaterial>,
+    material: &Handle<TreeMaterial>,
     lod: nature::TreeLod,
     origin: Vec3,
+    graphics: &Graphics,
 ) -> Entity {
     let mut entity = commands.spawn((
         Mesh3d(mesh),
         MeshMaterial3d(material.clone()),
         Transform::from_translation(origin),
-        tree_lod_range(lod),
+        tree_lod_range(lod, tree_detail(graphics)),
+        TreeLevel(lod),
     ));
-    // Les silhouettes lointaines ne portent pas d'ombre (hors cascades).
-    if lod == nature::TreeLod::Silhouette {
+    if !tree_casts_shadow(lod, graphics) {
         entity.insert(bevy::light::NotShadowCaster);
     }
     entity.id()
@@ -361,7 +524,7 @@ fn spawn_tree_entity(
 struct Forest {
     cells: Vec<ForestCell>,
     models: nature::TreeModels,
-    material: Handle<StandardMaterial>,
+    material: Handle<TreeMaterial>,
 }
 
 struct ForestCell {
@@ -383,7 +546,7 @@ impl ForestCell {
 
 /// Caméra orbitale amortie et bornée.
 #[derive(Component, Debug)]
-struct OrbitCamera {
+pub(crate) struct OrbitCamera {
     focus: Vec3,
     yaw: f32,
     pitch: f32,
@@ -394,6 +557,20 @@ struct OrbitCamera {
     target_pitch: f32,
     target_distance: f32,
     bounds: nature::CameraBounds,
+}
+
+impl OrbitCamera {
+    /// Saut immédiat vers un point de vue (tour, tests scriptés).
+    pub(crate) fn look_at(&mut self, focus: Vec3, yaw: f32, pitch: f32, distance: f32) {
+        self.target_focus = focus;
+        self.target_yaw = yaw;
+        self.target_pitch = pitch;
+        self.target_distance = distance;
+        self.focus = focus;
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self.distance = distance;
+    }
 }
 
 #[derive(Component)]
@@ -590,7 +767,12 @@ fn setup(
     sim: Res<Sim>,
     mut handles: ResMut<Handles>,
     mut city: ResMut<City>,
+    graphics: Res<Graphics>,
+    mut tree_materials: ResMut<Assets<TreeMaterial>>,
 ) {
+    // Un seul passage, à la fin de l'écran de chargement.
+    commands.remove_resource::<screens::BuildScene>();
+    commands.insert_resource(ClearColor(srgb(nature::HORIZON_COLOR)));
     let world = &sim.world;
     let static_usage = RenderAssetUsages::RENDER_WORLD;
 
@@ -605,7 +787,8 @@ fn setup(
         extension: TerrainExtension {
             layers: images.add(terrain_layers()),
             scales_a: Vec4::new(s[0], s[1], s[2], s[3]),
-            scales_b: Vec4::new(s[4], s[5], 0.0, 0.0),
+            // z : détail du sol selon le préréglage (`terrain.wesl`).
+            scales_b: Vec4::new(s[4], s[5], graphics.0.terrain_detail, 0.0),
         },
     });
     for chunk in nature::ground_chunks(world, 96).into_iter().filter(|_| !disabled("sol")) {
@@ -662,7 +845,7 @@ fn setup(
     // Arbres : un seul matériau, l'atlas (cartes de feuillage, écorces,
     // imposteurs) détouré par son alpha. Pas de « double_sided » : les deux
     // faces d'une carte gardent la même normale de canopée.
-    let tree_mat = materials.add(StandardMaterial {
+    let tree_mat = tree_materials.add(TreeMaterial { extension: TreeExtension {}, base: StandardMaterial {
         base_color: Color::WHITE,
         base_color_texture: Some(images.add(tree_atlas())),
         alpha_mode: AlphaMode::Mask(nature::TREE_ALPHA_CUTOFF),
@@ -671,7 +854,7 @@ fn setup(
         perceptual_roughness: 0.85,
         reflectance: 0.2,
         ..default()
-    });
+    } });
     // Forêts : silhouettes permanentes ici ; modèle complet et allégé à la
     // demande (`stream_forest`). Les trois niveaux d'une cellule partagent
     // la même origine, pour des fondus (`VisibilityRange`) exacts.
@@ -704,7 +887,7 @@ fn setup(
         let chunk = nature::build_trees(&current, nature::TreeLod::Silhouette, &forest.models, origin);
         // Ville : mesh modifiable (la ville empiète) ; décor : GPU seulement.
         let silhouette = meshes.add(if in_city { tree_mesh(chunk) } else { static_tree_mesh(chunk) });
-        spawn_tree_entity(&mut commands, silhouette.clone(), &tree_mat, nature::TreeLod::Silhouette, Vec3::from(origin));
+        spawn_tree_entity(&mut commands, silhouette.clone(), &tree_mat, nature::TreeLod::Silhouette, Vec3::from(origin), &graphics);
         forest.cells.push(ForestCell { spots, current, origin, silhouette, streamed: [None, None] });
     }
     commands.insert_resource(forest);
@@ -732,18 +915,15 @@ fn setup(
         DirectionalLight {
             illuminance: 11_000.0,
             color: Color::srgb(1.0, 0.96, 0.88),
-            shadow_maps_enabled: !disabled("ombres"),
+            shadow_maps_enabled: graphics.0.shadows.is_some() && !disabled("ombres"),
             ..default()
         },
         Transform::from_xyz(-0.55, 0.62, 0.45).looking_at(Vec3::ZERO, Vec3::Y),
-        CascadeShadowConfigBuilder {
-            num_cascades: 4,
-            first_cascade_far_bound: 180.0,
-            maximum_distance: 2_600.0,
-            ..default()
-        }
-        .build(),
+        cascade_config(graphics.0.shadows.unwrap_or(crate::session::ShadowProfile { cascades: 1, first_far_m: 100.0, max_m: 200.0, map_size: 512 })),
     ));
+    if let Some(shadow) = graphics.0.shadows {
+        commands.insert_resource(bevy::light::DirectionalLightShadowMap { size: shadow.map_size });
+    }
     commands.insert_resource(GlobalAmbientLight {
         color: srgb(nature::HORIZON_COLOR),
         brightness: 380.0,
@@ -752,17 +932,20 @@ fn setup(
 
     // --- caméra
     let bounds = nature::camera_bounds(world);
-    let center = scene::map_center(world);
+    let center = scene::start_focus(world);
     let focus = Vec3::new(center[0], nature::ground_altitude_m(world, center[0], center[2]), center[2]);
+    // Carte vierge : on démarre près de la route d'entrée, assez bas pour
+    // construire ; ville existante : vue d'ensemble.
+    let (pitch, distance) = if world.buildings().live_count() == 0 { (0.62, 420.0) } else { (0.42, 1_500.0) };
     let orbit = OrbitCamera {
         focus,
         yaw: 0.8,
-        pitch: 0.42,
-        distance: 1_500.0,
+        pitch,
+        distance,
         target_focus: focus,
         target_yaw: 0.8,
-        target_pitch: 0.42,
-        target_distance: 1_500.0,
+        target_pitch: pitch,
+        target_distance: distance,
         bounds,
     };
     let transform = orbit_transform(&orbit, world);
@@ -786,14 +969,48 @@ fn setup(
             ),
         },
         orbit,
-        if disabled("msaa") { Msaa::Off } else { Msaa::default() },
+        msaa_of(&graphics),
+        // Pré-passe de profondeur : les shaders coûteux (sol à six couches,
+        // eau, feuillage) ne tournent qu'une fois par pixel visible.
+        // Mesuré : +30 % d'images/s en Bas, +55 % en Haut sur puce intégrée.
     ));
+    if !disabled("prepasse") {
+        commands.queue(|world: &mut bevy::ecs::world::World| {
+            let mut cameras = world.query_filtered::<Entity, With<Camera3d>>();
+            let found: Vec<Entity> = cameras.iter(world).collect();
+            for camera in found {
+                world.entity_mut(camera).insert(bevy::core_pipeline::prepass::DepthPrepass);
+            }
+        });
+    }
+
 }
 
-fn step_simulation(time: Res<Time>, mut sim: ResMut<Sim>) {
-    let batch = sim.clock.advance(time.delta());
+/// Avance la simulation au rythme choisi et publie les événements notables
+/// dans le fil d'actualité (textes traduits).
+fn step_simulation(time: Res<Time>, mut sim: ResMut<Sim>, texts: Res<Texts>, mut feed: ResMut<hud::Feed>) {
+    let factor = match sim.speed {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    };
+    let batch = sim.clock.advance(time.delta() * factor);
     for _ in 0..batch.ticks {
-        sim.world.tick();
+        let report = sim.world.tick();
+        let month = sim.world.snapshot().month;
+        for event in &report.events {
+            use sim_core::SimEvent as E;
+            let notable = matches!(
+                event,
+                E::CommandRejected { .. } | E::RoadsOpened { .. } | E::RoundaboutBuilt { .. } | E::BudgetSettled { .. } | E::RoadsRemoved { .. }
+            );
+            if notable {
+                if let Some(message) = city_ui::text::event(&texts, event, month as u32) {
+                    feed.push(message, matches!(event, E::CommandRejected { .. }));
+                }
+            }
+        }
     }
 }
 
@@ -806,6 +1023,8 @@ fn camera_controls(
     time: Res<Time>,
     sim: Res<Sim>,
     tour: Res<Tour>,
+    tools: Res<hud::Tools>,
+    over_hud: Res<hud::PointerOverHud>,
     mut query: Query<(&mut Transform, &mut OrbitCamera)>,
 ) {
     let dt = time.delta_secs().min(0.1);
@@ -832,8 +1051,10 @@ fn camera_controls(
             if keys.pressed(KeyCode::KeyX) || keys.pressed(KeyCode::Minus) {
                 zoom *= 1.0 + 1.6 * dt;
             }
-            // Molette : un cran = 12 %.
-            zoom *= 0.88f32.powf(scroll.delta.y);
+            // Molette : un cran = 12 % (pas au-dessus des panneaux).
+            if !over_hud.0 {
+                zoom *= 0.88f32.powf(scroll.delta.y);
+            }
             camera.target_distance *= zoom;
 
             let forward = Vec3::new(-camera.target_yaw.sin(), 0.0, -camera.target_yaw.cos());
@@ -858,7 +1079,9 @@ fn camera_controls(
                 camera.target_yaw -= delta.x * 0.005;
                 camera.target_pitch += delta.y * 0.004;
             }
-            if buttons.pressed(MouseButton::Middle) || buttons.pressed(MouseButton::Left) {
+            // Clic gauche : aux outils, sauf sans outil (il déplace alors la vue).
+            let left_pans = tools.controller.tool == city_ui::tools::Tool::Select && !over_hud.0;
+            if buttons.pressed(MouseButton::Middle) || (left_pans && buttons.pressed(MouseButton::Left)) {
                 // Glisser = attraper le sol : le déplacement suit la souris,
                 // proportionnel à la distance.
                 let scale = camera.target_distance * 0.0016;
@@ -990,7 +1213,9 @@ fn city_spots(
 /// Construit/libère le modèle complet et le modèle allégé des cellules selon
 /// la distance à la caméra, avec un budget d'arbres par passage pour ne pas
 /// figer l'image quand la caméra saute.
+#[allow(clippy::too_many_arguments)]
 fn stream_forest(
+    graphics: Res<Graphics>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut forest: ResMut<Forest>,
@@ -1024,12 +1249,12 @@ fn stream_forest(
         let cell = &mut forest.cells[index];
         for (slot, lod) in STREAMED_LODS.iter().enumerate() {
             let built = cell.streamed[slot].is_some();
-            let wanted = nature::streamed_lod_wanted(*lod, distance, built);
+            let wanted = nature::streamed_lod_wanted_scaled(*lod, distance, built, tree_detail(&graphics));
             if wanted && !built && budget >= cell.current.len() {
                 budget -= cell.current.len();
                 let chunk = nature::build_trees(&cell.current, *lod, &forest.models, cell.origin);
                 let handle = meshes.add(static_tree_mesh(chunk));
-                let entity = spawn_tree_entity(&mut commands, handle.clone(), &forest.material, *lod, Vec3::from(cell.origin));
+                let entity = spawn_tree_entity(&mut commands, handle.clone(), &forest.material, *lod, Vec3::from(cell.origin), &graphics);
                 cell.streamed[slot] = Some((entity, handle));
             } else if !wanted && built {
                 if let Some((entity, handle)) = cell.streamed[slot].take() {
@@ -1062,11 +1287,13 @@ fn tree_mesh(chunk: nature::TreeChunk) -> Mesh {
 
 /// Tour de vérification : une suite de points de vue capturés puis on quitte.
 #[derive(Resource)]
-struct Tour {
-    active: bool,
+pub(crate) struct Tour {
+    pub(crate) active: bool,
     step: usize,
     elapsed: f32,
     shot_taken: bool,
+    /// Caméra placée sur la vue courante.
+    positioned: bool,
     /// Images rendues et temps cumulé, pour la mesure de performance.
     frames: u32,
     frame_time: f32,
@@ -1085,7 +1312,11 @@ const LANDMARK_VIEWS: [(&str, f32, f32, f32); 5] = [
 ];
 
 impl Tour {
-    fn new(active: bool, world: &World) -> Self {
+    fn inactive() -> Self {
+        Self { active: false, step: 0, elapsed: 0.0, shot_taken: false, positioned: false, frames: 0, frame_time: 0.0, views: Vec::new() }
+    }
+
+    pub(crate) fn new(active: bool, world: &World) -> Self {
         let (w, h) = nature::play_size_m(world);
         let mut views: Vec<_> = TOUR_VIEWS
             .iter()
@@ -1099,7 +1330,7 @@ impl Tour {
                 views.push((name.to_owned(), Vec3::from(*p), yaw, pitch, distance));
             }
         }
-        Self { active, step: 0, elapsed: 0.0, shot_taken: false, frames: 0, frame_time: 0.0, views }
+        Self { active, step: 0, elapsed: 0.0, shot_taken: false, positioned: false, frames: 0, frame_time: 0.0, views }
     }
 }
 
@@ -1146,7 +1377,10 @@ fn tour_step(
         tour.frames += 1;
         tour.frame_time += time.delta_secs();
     }
-    if tour.elapsed < 0.1 {
+    // Une seule fois par vue, quel que soit le temps d'image (à 8 i/s, une
+    // image dure plus que la fenêtre de 0,1 s d'avant).
+    if !tour.positioned {
+        tour.positioned = true;
         for mut camera in &mut cameras {
             camera.target_focus = focus;
             camera.target_yaw = yaw;
@@ -1169,6 +1403,7 @@ fn tour_step(
         tour.step += 1;
         tour.elapsed = 0.0;
         tour.shot_taken = false;
+        tour.positioned = false;
     }
 }
 
@@ -1179,7 +1414,7 @@ fn auto_screenshot(
     mut done: Local<bool>,
     time: Res<Time>,
 ) {
-    if *done || tour.active {
+    if *done || tour.active || std::env::var_os("CITYMAYOR_TOOLTEST").is_some() {
         return;
     }
     *elapsed += time.delta_secs();

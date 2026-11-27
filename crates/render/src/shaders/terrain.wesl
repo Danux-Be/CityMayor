@@ -16,7 +16,8 @@ import bevy_pbr::render::{
 };
 
 struct TerrainParams {
-    // Taille d'une répétition (m) des couches 0..3 et 4..5 (z, w inutilisés).
+    // Taille d'une répétition (m) des couches 0..3 et 4..5 ; scales_b.z :
+    // détail (0 = une lecture par couche, sans triplanaire : préréglage Bas).
     scales_a: vec4<f32>,
     scales_b: vec4<f32>,
 }
@@ -28,6 +29,11 @@ struct TerrainParams {
 // Échantillon à deux échelles : détail proche + variation lointaine.
 fn sample_layer(layer: i32, uv: vec2<f32>, far_mix: f32) -> vec3<f32> {
     let near = textureSample(layers, layers_sampler, uv, layer).rgb;
+    // Préréglage Bas : une seule lecture (branche uniforme : même valeur
+    // pour tous les pixels, les dérivées restent valides).
+    if (params.scales_b.z < 0.5) {
+        return near;
+    }
     let far = textureSample(layers, layers_sampler, uv * 0.173 + vec2<f32>(0.31, 0.67), layer).rgb;
     return mix(mix(near, far, 0.3), far, far_mix);
 }
@@ -61,12 +67,14 @@ fn fragment(
     // Roche triplanaire : sur une falaise, la projection verticale étire la
     // texture ; on mélange les trois projections selon la normale.
     let rock_scale = params.scales_a.w;
-    let tri = pow(abs(n), vec3<f32>(4.0));
-    let tri_w = tri / (tri.x + tri.y + tri.z);
-    let r_x = sample_layer(3, p.zy / rock_scale, far_mix);
-    let r_y = sample_layer(3, p.xz / rock_scale, far_mix);
-    let r_z = sample_layer(3, p.xy / rock_scale, far_mix);
-    let c3 = r_x * tri_w.x + r_y * tri_w.y + r_z * tri_w.z;
+    var c3 = sample_layer(3, p.xz / rock_scale, far_mix);
+    if (params.scales_b.z >= 0.5) {
+        let tri = pow(abs(n), vec3<f32>(4.0));
+        let tri_w = tri / (tri.x + tri.y + tri.z);
+        let r_x = sample_layer(3, p.zy / rock_scale, far_mix);
+        let r_z = sample_layer(3, p.xy / rock_scale, far_mix);
+        c3 = r_x * tri_w.x + c3 * tri_w.y + r_z * tri_w.z;
+    }
 
     // Mélange par hauteur : chaque poids est modulé par la luminance de sa
     // texture, puis accentué. Les transitions suivent les cailloux, les

@@ -692,6 +692,14 @@ fn roundabouts_are_closed_one_way_rings_that_streets_can_join() {
     let street = roads.segments().find(|(_, s)| !s.spec.is_one_way()).unwrap().1;
     assert!(street.a == east || street.b == east);
     assert!(street.curve.is_straight());
+
+    // Démolir un arc emporte tout l'anneau ; la rue reste.
+    let arc = roads.find_segment(ring.nodes[2], ring.nodes[3]).unwrap();
+    world.queue(Command::BulldozeRoad { segment: arc });
+    let report = world.tick();
+    assert!(report.events.iter().any(|e| matches!(e, sim_core::SimEvent::RoadsRemoved { count: 8 })));
+    assert_eq!(world.roads().live_segments(), 1);
+    assert!(world.roads().roundabouts().is_empty());
 }
 
 #[test]
@@ -756,4 +764,32 @@ fn demolishing_a_building_site_cancels_its_delivery() {
         let report = world.tick();
         assert!(!report.events.iter().any(|e| matches!(e, sim_core::SimEvent::BuildingCompleted { .. })));
     }
+}
+
+#[test]
+fn higher_taxes_bring_more_money_but_less_demand() {
+    let run = |percent: u8| {
+        let mut world = World::new(instant_roads(), 41, Terrain::flat(32, 32));
+        world.queue(Command::BuildRoad {
+            from: Point::new(tile_center_m(2), tile_center_m(10)),
+            to: Point::new(tile_center_m(28), tile_center_m(10)),
+            spec: RoadSpec::TWO_WAY,
+        });
+        world.queue(Command::ZoneRect { rect: Rect::new(3, 11, 26, 12), zone: ZoneType::Residential });
+        world.queue(Command::ZoneRect { rect: Rect::new(3, 8, 26, 9), zone: ZoneType::Commercial });
+        world.queue(Command::SetTaxes { residential_percent: percent, business_percent: percent });
+        for _ in 0..600 {
+            world.tick();
+        }
+        world
+    };
+    let (low, high) = (run(4), run(20));
+    assert_eq!(high.treasury().tax_percent, [20, 20]);
+    assert!(high.snapshot().demand.residential < low.snapshot().demand.residential);
+    // À population égale, le taux élevé rapporte plus par habitant.
+    let per_head = |w: &World| {
+        let b = w.budget_estimate();
+        b.residential_tax_cents as f64 / f64::from(w.snapshot().population.max(1))
+    };
+    assert!(per_head(&high) > per_head(&low) * 4.0);
 }

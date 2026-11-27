@@ -10,12 +10,14 @@ authors.workspace = true
 [features]
 # Le viewer n'est pas compilé par défaut : `cargo test` reste à 3 s sans tirer
 # Bevy. Activation : `cargo run -p citymayor-app --features viewer --bin city-viewer`.
-viewer = ["dep:bevy", "dep:city-i18n"]
+viewer = ["dep:bevy", "dep:city-i18n", "dep:city-ui"]
 
 [dependencies]
 sim-core = { workspace = true }
 # Textes du viewer (titre, futur HUD) : fichiers de langue.
 city-i18n = { workspace = true, optional = true }
+# Outils de construction et textes du jeu (HUD).
+city-ui = { path = "../ui", optional = true }
 # Lecture des arbres modélisés dans Blender (`.glb` embarqués), sans le
 # chargeur glTF de Bevy : on fusionne la géométrie nous-mêmes.
 gltf = { version = "1.4", default-features = false, features = ["utils"] }
@@ -28,6 +30,10 @@ bevy = { version = "0.20.1", optional = true, default-features = false, features
     "bevy_pbr",
     "bevy_render",
     "bevy_window",
+    "bevy_ui",
+    "bevy_ui_render",
+    "bevy_text",
+    "bevy_state",
     "bevy_winit",
     "multi_threaded",
     "png",

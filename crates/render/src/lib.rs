@@ -31,8 +31,13 @@
 pub mod nature;
 pub mod roads;
 pub mod scene;
+pub mod session;
 pub mod site;
 pub mod urban;
 
+#[cfg(feature = "viewer")]
+pub mod hud;
+#[cfg(feature = "viewer")]
+pub mod screens;
 #[cfg(feature = "viewer")]
 pub mod viewer;
