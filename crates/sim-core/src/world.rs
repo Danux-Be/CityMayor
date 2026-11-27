@@ -182,6 +182,10 @@ pub enum SimEvent {
         id: BuildingId,
         kind: BuildingKind,
     },
+    /// Des segments de route ont été démolis.
+    RoadsRemoved {
+        count: u32,
+    },
     /// Des chantiers de route se sont achevés : les routes sont ouvertes.
     RoadsOpened {
         count: u32,
@@ -525,6 +529,15 @@ impl World {
                 Command::BuildRoundabout { center, radius_m, spec } => {
                     self.build_roundabout(center, radius_m, spec);
                 }
+                Command::BulldozeRoad { segment } => match self.roads.bulldoze(segment) {
+                    Ok(count) => {
+                        self.roads.ensure_topology();
+                        self.road_access_dirty = true;
+                        self.next_road_opening = self.roads.next_opening(self.tick);
+                        self.events.push(SimEvent::RoadsRemoved { count });
+                    }
+                    Err(error) => self.events.push(SimEvent::CommandRejected { error: CommandError::Road(error) }),
+                },
             }
         }
     }

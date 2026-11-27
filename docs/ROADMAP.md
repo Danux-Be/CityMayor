@@ -20,7 +20,7 @@
 | 2 | Routes | catalogue de types (chemin, rue 2 voies, sens unique 1 et 2 voies, avenue 4 voies, boulevard à terre-plein, autoroute 2×2 et 2×3 avec bretelles), chantier de route (route en construction, coût, durée) | fait (sauf coût de construction et échangeurs dénivelés) |
 | 3 | Ronds-points | nœud giratoire dans le graphe (sens de circulation, priorité), géométrie et marquages, outil de pose | fait (sauf outil de pose, qui vient avec le HUD) |
 | 4 | Construction des bâtiments | stades dans `sim-core` (terrain préparé → fondations → gros œuvre → finitions → occupé), progression déterministe, rendu de chaque stade (palissade, fondations, échafaudages, grue) modélisé dans Blender | fait |
-| 5 | HUD et outils | barre d'outils, zonage au pinceau, tracé de routes courbes, démolition, panneaux (budget, demande, infos), vitesse du temps ; tous les textes traduits | à faire |
+| 5 | HUD et outils | barre d'outils, zonage au pinceau, tracé de routes courbes, démolition, panneaux (budget, demande, infos), vitesse du temps ; tous les textes traduits | en partie : barre d'infos, vitesse, outils route / rond-point / zonage / démolition faits ; panneaux budget et infos, vues d'information à venir |
 | 6 | Rendu commercial | textures 2K avec normales et rugosité en jeu, plus de modèles de bâtiments par niveau de richesse, nuit et fenêtres éclairées, eau réfléchissante, occlusion ambiante | à faire |
 | 7 | Trafic | A* déterministe, véhicules animés, feux et priorités, overlay de trafic | à faire |
 | 8 | Services et économie | électricité, eau, police, santé, éducation, pollution, niveaux de bâtiments, budget détaillé | à faire |

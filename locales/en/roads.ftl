@@ -21,6 +21,10 @@ road-opens-in = Opens in { $days ->
 }
 
 event-roundabout-built = Roundabout built
+event-roads-removed = { $count ->
+    [one] Road demolished
+   *[other] { $count } road sections demolished
+}
 event-roads-opened = { $count ->
     [one] A road has opened to traffic
    *[other] { $count } roads have opened to traffic

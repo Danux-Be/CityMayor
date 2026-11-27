@@ -692,6 +692,14 @@ fn roundabouts_are_closed_one_way_rings_that_streets_can_join() {
     let street = roads.segments().find(|(_, s)| !s.spec.is_one_way()).unwrap().1;
     assert!(street.a == east || street.b == east);
     assert!(street.curve.is_straight());
+
+    // Démolir un arc emporte tout l'anneau ; la rue reste.
+    let arc = roads.find_segment(ring.nodes[2], ring.nodes[3]).unwrap();
+    world.queue(Command::BulldozeRoad { segment: arc });
+    let report = world.tick();
+    assert!(report.events.iter().any(|e| matches!(e, sim_core::SimEvent::RoadsRemoved { count: 8 })));
+    assert_eq!(world.roads().live_segments(), 1);
+    assert!(world.roads().roundabouts().is_empty());
 }
 
 #[test]
