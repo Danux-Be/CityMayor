@@ -19,6 +19,7 @@
 //! - `CameraInput` (orbite/pan/zoom amortis, focus au clic sur une tuile).
 
 pub mod text;
+pub mod tools;
 
 pub use city_i18n::{Arg, Localizer};
 

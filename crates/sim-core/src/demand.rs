@@ -87,6 +87,23 @@ impl Demand {
     }
 }
 
+/// Effet des impôts : chaque point au-dessus du taux neutre freine la
+/// demande (résidentielle pour l'impôt des habitants, commerciale et
+/// industrielle pour celui des entreprises), chaque point en dessous la
+/// stimule. ±1,5 % de demande par point.
+#[must_use]
+pub fn apply_taxes(demand: Demand, tax_percent: [u8; 2]) -> Demand {
+    let effect = |percent: u8| {
+        let points = i32::from(crate::economy::NEUTRAL_TAX_PERCENT) - i32::from(percent);
+        Fixed::from_permille(15).mul(Fixed::from_int(points))
+    };
+    Demand {
+        residential: (demand.residential + effect(tax_percent[0])).clamp01(),
+        commercial: (demand.commercial + effect(tax_percent[1])).clamp01(),
+        industrial: (demand.industrial + effect(tax_percent[1])).clamp01(),
+    }
+}
+
 #[must_use]
 pub fn compute(census: &Census, p: &DemandParams) -> Demand {
     let vacancy = census.vacancy_ratio();

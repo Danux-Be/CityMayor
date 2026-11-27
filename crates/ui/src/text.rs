@@ -45,10 +45,34 @@ pub fn construction(loc: &Localizer, stage: ConstructionStage, progress: Fixed) 
     )
 }
 
+/// Entier avec séparateur de milliers de la langue (`number-group-separator`).
+#[must_use]
+pub fn number(loc: &Localizer, value: i64) -> String {
+    let separator = loc.text("number-group-separator");
+    let digits = value.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push_str(&separator);
+        }
+        out.push(c);
+    }
+    if value < 0 { format!("-{out}") } else { out }
+}
+
+/// Nombre d'habitants, pluriel et séparateurs compris.
+#[must_use]
+pub fn inhabitants(loc: &Localizer, count: u32) -> String {
+    loc.format(
+        "unit-inhabitants",
+        &[("count", Arg::from(count)), ("formatted", Arg::from(number(loc, i64::from(count))))],
+    )
+}
+
 /// Somme en dollars (centimes → unités entières).
 #[must_use]
 pub fn money(loc: &Localizer, cents: i64) -> String {
-    loc.format("unit-money", &[("value", Arg::from(cents / 100))])
+    loc.format("unit-money", &[("value", Arg::from(number(loc, cents / 100)))])
 }
 
 /// Message d'actualité d'un événement de simulation, s'il en mérite un.
@@ -87,6 +111,7 @@ pub fn event(loc: &Localizer, event: &SimEvent, month: u32) -> Option<String> {
             loc.format("error-command-rejected", &[("reason", Arg::from(command_error(loc, error)))])
         }
         SimEvent::RoundaboutBuilt { .. } => loc.text("event-roundabout-built"),
+        SimEvent::RoadsRemoved { count } => loc.format("event-roads-removed", &[("count", Arg::from(*count))]),
         SimEvent::RoadsOpened { count } => loc.format("event-roads-opened", &[("count", Arg::from(*count))]),
         #[allow(unreachable_patterns)]
         _ => return None,
@@ -113,6 +138,19 @@ mod tests {
         keys.extend(RoadSpec::CATALOGUE.iter().map(|(key, _)| *key));
         keys.push("road-custom");
         keys.extend(ConstructionStage::ALL.iter().map(|s| s.message_key()));
+        // Aides et refus des outils (renvoyés par `tools`, pas écrits en dur).
+        use crate::tools::Tool;
+        for tool in [
+            Tool::Select,
+            Tool::Road { spec: RoadSpec::TWO_WAY, curved: false },
+            Tool::Road { spec: RoadSpec::TWO_WAY, curved: true },
+            Tool::Roundabout { radius_m: 20 },
+            Tool::Zone(ZoneType::Residential),
+            Tool::Bulldoze,
+        ] {
+            keys.extend((0..3).map(|step| tool.hint_key(step)));
+        }
+        keys.extend(["tool-error-too-short", "tool-error-water", "error-out-of-bounds"]);
         let missing: Vec<_> = keys.into_iter().filter(|k| !en.has(k)).collect();
         assert!(missing.is_empty(), "clés absentes de locales/en : {missing:?}");
     }
@@ -175,6 +213,9 @@ mod tests {
             event(&en, &rejected, 1).unwrap(),
             "Action refused: You can't build outside the city limits."
         );
-        assert_eq!(money(&en, 123_456), "$1234");
+        assert_eq!(money(&en, 123_456), "$1,234");
+        assert_eq!(money(&en, 500_000_000), "$5,000,000");
+        assert_eq!(inhabitants(&en, 16_242), "16,242 inhabitants");
+        assert_eq!(inhabitants(&en, 1), "1 inhabitant");
     }
 }

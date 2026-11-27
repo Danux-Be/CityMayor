@@ -10,6 +10,7 @@ locales/
     errors.ftl        messages shown when an action is refused
     interface.ftl     window, HUD, tools
     roads.ftl         road types, road works, roundabouts
+    menu.ftl          splash, main menu, loading screen, pause menu, settings
   <code>/             a translation (BCP 47 code: fr, de, pt-BR…)
 ```
 

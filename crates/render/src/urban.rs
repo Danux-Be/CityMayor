@@ -1343,13 +1343,18 @@ fn visual_step(stage: ConstructionStage, within: f32) -> u64 {
     }
 }
 
-/// Empreinte des bâtiments d'un carré de tuiles : change dès qu'un bâtiment
-/// y apparaît, disparaît ou change de type/capacité.
+/// Empreintes des bâtiments d'un carré de tuiles : `(visuelle, occupation)`.
+///
+/// - visuelle : change dès qu'un bâtiment apparaît, disparaît, change de
+///   type/capacité ou franchit un palier de chantier (géométrie à refaire) ;
+/// - occupation : seulement à l'apparition ou la disparition d'un bâtiment
+///   (les arbres de la ville n'en dépendent pas davantage).
 #[must_use]
-pub fn buildings_signature(world: &World, x0: u32, y0: u32, x1: u32, y1: u32) -> u64 {
+pub fn buildings_signature(world: &World, x0: u32, y0: u32, x1: u32, y1: u32) -> (u64, u64) {
     let grid = world.zoning().grid();
     let now = world.current_tick();
     let mut signature = 0xC17E_u64;
+    let mut occupancy = 0x0CC0_u64;
     for y in y0..y1.min(grid.height()) {
         for x in x0..x1.min(grid.width()) {
             let Some(tile) = grid.tile_at(x, y) else { continue };
@@ -1358,11 +1363,13 @@ pub fn buildings_signature(world: &World, x0: u32, y0: u32, x1: u32, y1: u32) ->
                 // Chantier : stade, et quart d'avancement (la structure monte).
                 let (stage, within) = building.stage(now);
                 let step = (stage as u64) << 8 | visual_step(stage, within.to_f32());
-                signature = hash(signature ^ (u64::from(tile.raw()) << 20) ^ (kind << 16) ^ u64::from(building.capacity) ^ (step << 40));
+                let base = (u64::from(tile.raw()) << 20) ^ (kind << 16) ^ u64::from(building.capacity);
+                signature = hash(signature ^ base ^ (step << 40));
+                occupancy = hash(occupancy ^ base);
             }
         }
     }
-    signature
+    (signature, occupancy)
 }
 
 // ------------------------------------------------------------------ voirie
