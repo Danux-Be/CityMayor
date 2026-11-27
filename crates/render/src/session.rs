@@ -23,6 +23,7 @@ pub const SAVE_EXTENSION: &str = "cmsave";
 #[must_use]
 pub fn scenario(name: &str) -> Option<World> {
     match name {
+        "blank" => Some(scene::blank_map()),
         "demo" => Some(scene::demo_city()),
         "block" => Some(scene::small_block()),
         _ => None,

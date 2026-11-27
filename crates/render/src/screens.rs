@@ -610,7 +610,9 @@ fn menu_clicks(
             }
         }
         MenuAction::NewGame => {
-            commands.insert_resource(LoadRequest::New { scenario: "demo".into(), ticks: session::NEW_GAME_TICKS });
+            // Nouvelle partie : carte vierge (la démo pré-construite reste pour
+            // le tour de captures). Quelques ticks pour poser la route d'entrée.
+            commands.insert_resource(LoadRequest::New { scenario: "blank".into(), ticks: 2 });
             error.0 = None;
             next.set(AppState::Loading);
         }

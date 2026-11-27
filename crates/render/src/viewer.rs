@@ -106,13 +106,17 @@ impl MaterialExtension for UrbanExtension {
 /// Lancée par le binaire `city-viewer`.
 ///
 /// Déroulé : écran du studio → menu principal → chargement → partie
-/// (`screens`). Les tours de captures (`CITYMAYOR_TOUR`) et le test des
-/// outils (`CITYMAYOR_TOOLTEST`) vont droit au chargement.
+/// (`screens`). Les tours de captures (`CITYMAYOR_TOUR`), le test des
+/// outils (`CITYMAYOR_TOOLTEST`) et `CITYMAYOR_NEWGAME` (nouvelle partie
+/// sur carte vierge) vont droit au chargement.
 pub fn run() {
     let tool_test = std::env::var_os("CITYMAYOR_TOOLTEST").is_some();
     let tour = std::env::var_os("CITYMAYOR_TOUR").is_some();
     let (start, request) = if tool_test {
         (screens::AppState::Loading, Some(screens::LoadRequest::New { scenario: "block".into(), ticks: 1_500 }))
+    } else if std::env::var_os("CITYMAYOR_NEWGAME").is_some() {
+        // Raccourci de développement : nouvelle partie sans passer par le menu.
+        (screens::AppState::Loading, Some(screens::LoadRequest::New { scenario: "blank".into(), ticks: 2 }))
     } else if tour {
         (screens::AppState::Loading, Some(screens::LoadRequest::New { scenario: "demo".into(), ticks: PRESIMULATION_TICKS }))
     } else {
@@ -801,17 +805,20 @@ fn setup(
 
     // --- caméra
     let bounds = nature::camera_bounds(world);
-    let center = scene::map_center(world);
+    let center = scene::start_focus(world);
     let focus = Vec3::new(center[0], nature::ground_altitude_m(world, center[0], center[2]), center[2]);
+    // Carte vierge : on démarre près de la route d'entrée, assez bas pour
+    // construire ; ville existante : vue d'ensemble.
+    let (pitch, distance) = if world.buildings().live_count() == 0 { (0.62, 420.0) } else { (0.42, 1_500.0) };
     let orbit = OrbitCamera {
         focus,
         yaw: 0.8,
-        pitch: 0.42,
-        distance: 1_500.0,
+        pitch,
+        distance,
         target_focus: focus,
         target_yaw: 0.8,
-        target_pitch: 0.42,
-        target_distance: 1_500.0,
+        target_pitch: pitch,
+        target_distance: distance,
         bounds,
     };
     let transform = orbit_transform(&orbit, world);
