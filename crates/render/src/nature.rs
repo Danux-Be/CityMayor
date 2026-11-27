@@ -572,7 +572,41 @@ pub const STREAM_HYSTERESIS_M: f32 = 100.0;
 /// oomd. Seules les cellules proches de la caméra en ont besoin.
 #[must_use]
 pub fn streamed_lod_wanted(lod: TreeLod, distance: f32, built: bool) -> bool {
-    let reach = tree_lod_distances(lod).1 .1 + STREAM_MARGIN_M;
+    streamed_lod_wanted_scaled(lod, distance, built, TreeDetail::FULL)
+}
+
+/// Facteurs de détail des arbres d'un préréglage graphique : fin du modèle
+/// complet (`model`), fin du modèle allégé (`reduced`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TreeDetail {
+    pub model: f32,
+    pub reduced: f32,
+}
+
+impl TreeDetail {
+    pub const FULL: Self = Self { model: 1.0, reduced: 1.0 };
+}
+
+/// Distances de détail d'un niveau, mises à l'échelle du préréglage
+/// graphique. Les silhouettes gardent leur portée : elles sont légères et ce
+/// sont elles qui habillent l'horizon.
+#[must_use]
+pub fn tree_lod_distances_scaled(lod: TreeLod, detail: TreeDetail) -> ((f32, f32), (f32, f32)) {
+    let ((s0, s1), (e0, e1)) = tree_lod_distances(lod);
+    let (m, r) = (detail.model, detail.reduced.max(detail.model * 0.4));
+    // Les bornes partagées entre deux niveaux restent identiques des deux
+    // côtés (fondu enchaîné exact).
+    match lod {
+        TreeLod::Model => ((s0, s1), (e0 * m, e1 * m)),
+        TreeLod::Reduced => ((s0 * m, s1 * m), (e0 * r, e1 * r)),
+        TreeLod::Silhouette => ((s0 * r, s1 * r), (e0, e1)),
+    }
+}
+
+/// [`streamed_lod_wanted`] pour un préréglage graphique donné.
+#[must_use]
+pub fn streamed_lod_wanted_scaled(lod: TreeLod, distance: f32, built: bool, detail: TreeDetail) -> bool {
+    let reach = tree_lod_distances_scaled(lod, detail).1 .1 + STREAM_MARGIN_M;
     match lod {
         TreeLod::Silhouette => true,
         _ if built => distance < reach + STREAM_HYSTERESIS_M,

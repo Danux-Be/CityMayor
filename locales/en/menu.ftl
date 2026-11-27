@@ -31,7 +31,14 @@ error-load-failed = Could not load the game: { $reason }
 
 settings-title = Settings
 settings-fullscreen = Fullscreen
-settings-shadows = Shadows
+settings-quality = Graphics quality
+settings-gpu = Graphics card
+settings-gpu-integrated = { $name } (integrated graphics: performance will be limited)
+quality-auto = Auto ({ $resolved })
+quality-low = Low
+quality-medium = Medium
+quality-high = High
+quality-ultra = Ultra
 settings-ui-scale = Interface size
 settings-language = Language
 settings-on = On

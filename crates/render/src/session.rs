@@ -180,11 +180,129 @@ pub fn list_saves(dir: &Path) -> Vec<(PathBuf, SaveGame)> {
     saves
 }
 
+/// Préréglage graphique. `Auto` choisit selon la carte graphique.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Quality {
+    #[default]
+    Auto,
+    Low,
+    Medium,
+    High,
+    Ultra,
+}
+
+impl Quality {
+    pub const ALL: [Self; 5] = [Self::Auto, Self::Low, Self::Medium, Self::High, Self::Ultra];
+
+    /// Nom dans le fichier de réglages et clé de texte (`quality-<nom>`).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Ultra => "ultra",
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|q| q.name() == name)
+    }
+
+    /// Préréglage effectif : `Auto` devient `Low` sur une puce graphique
+    /// intégrée (ou un rendu logiciel), `High` sur une carte dédiée.
+    #[must_use]
+    pub const fn resolve(self, integrated_gpu: bool) -> Self {
+        match self {
+            Self::Auto if integrated_gpu => Self::Low,
+            Self::Auto => Self::High,
+            other => other,
+        }
+    }
+}
+
+/// Ombres d'un préréglage : cascades, limite de la première (m), portée (m),
+/// résolution de la carte d'ombres.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShadowProfile {
+    pub cascades: usize,
+    pub first_far_m: f32,
+    pub max_m: f32,
+    pub map_size: usize,
+}
+
+/// Ce que coûte un préréglage, poste par poste.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GraphicsProfile {
+    pub quality: Quality,
+    pub shadows: Option<ShadowProfile>,
+    /// Échantillons d'anticrénelage (1 = aucun).
+    pub msaa: u32,
+    /// Facteur des distances de détail des arbres : fin du modèle complet.
+    pub tree_detail: f32,
+    /// Facteur de la fin du modèle allégé (au-delà : silhouettes, deux
+    /// plans par arbre). C'est le poste le plus coûteux sur une puce
+    /// intégrée : des dizaines de cartes de feuillage superposées.
+    pub reduced_tree_detail: f32,
+    /// Les arbres au modèle allégé portent-ils une ombre ?
+    pub distant_tree_shadows: bool,
+    /// Sol : 0 = une lecture de texture par couche, 1 = deux échelles et
+    /// roche triplanaire.
+    pub terrain_detail: f32,
+}
+
+impl GraphicsProfile {
+    #[must_use]
+    pub fn of(quality: Quality) -> Self {
+        let shadows = |cascades, first_far_m, max_m, map_size| Some(ShadowProfile { cascades, first_far_m, max_m, map_size });
+        match quality {
+            Quality::Low | Quality::Auto => Self {
+                quality: Quality::Low,
+                shadows: None,
+                msaa: 1,
+                tree_detail: 0.6,
+                reduced_tree_detail: 0.3,
+                distant_tree_shadows: false,
+                terrain_detail: 0.0,
+            },
+            Quality::Medium => Self {
+                quality,
+                shadows: shadows(2, 150.0, 900.0, 1024),
+                msaa: 1,
+                tree_detail: 0.8,
+                reduced_tree_detail: 0.6,
+                distant_tree_shadows: false,
+                terrain_detail: 1.0,
+            },
+            Quality::High => Self {
+                quality,
+                shadows: shadows(3, 180.0, 1_800.0, 2048),
+                msaa: 4,
+                tree_detail: 1.0,
+                reduced_tree_detail: 1.0,
+                distant_tree_shadows: false,
+                terrain_detail: 1.0,
+            },
+            Quality::Ultra => Self {
+                quality,
+                shadows: shadows(4, 180.0, 2_600.0, 4096),
+                msaa: 4,
+                tree_detail: 1.3,
+                reduced_tree_detail: 1.3,
+                distant_tree_shadows: true,
+                terrain_detail: 1.0,
+            },
+        }
+    }
+}
+
 /// Réglages du joueur.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub fullscreen: bool,
-    pub shadows: bool,
+    pub quality: Quality,
     /// Taille de l'interface (%).
     pub ui_scale_percent: u16,
     pub language: String,
@@ -192,7 +310,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { fullscreen: false, shadows: true, ui_scale_percent: 100, language: city_i18n_default_language() }
+        Self { fullscreen: false, quality: Quality::Auto, ui_scale_percent: 100, language: city_i18n_default_language() }
     }
 }
 
@@ -220,7 +338,7 @@ impl Settings {
             let (key, value) = (key.trim(), value.trim());
             match key {
                 "fullscreen" => settings.fullscreen = value == "true",
-                "shadows" => settings.shadows = value != "false",
+                "quality" => settings.quality = Quality::from_name(value).unwrap_or_default(),
                 "ui_scale" => {
                     if let Ok(v) = value.parse::<u16>() {
                         settings.ui_scale_percent = v.clamp(UI_SCALES[0], UI_SCALES[UI_SCALES.len() - 1]);
@@ -244,8 +362,11 @@ impl Settings {
         std::fs::write(
             path,
             format!(
-                "# CityMayor settings\nfullscreen = {}\nshadows = {}\nui_scale = {}\nlanguage = {}\n",
-                self.fullscreen, self.shadows, self.ui_scale_percent, self.language
+                "# CityMayor settings\nfullscreen = {}\nquality = {}\nui_scale = {}\nlanguage = {}\n",
+                self.fullscreen,
+                self.quality.name(),
+                self.ui_scale_percent,
+                self.language
             ),
         )
     }
@@ -294,17 +415,35 @@ mod tests {
     }
 
     #[test]
+    fn presets_scale_their_costs() {
+        assert_eq!(Quality::Auto.resolve(true), Quality::Low);
+        assert_eq!(Quality::Auto.resolve(false), Quality::High);
+        assert_eq!(Quality::Ultra.resolve(true), Quality::Ultra);
+        let profiles: Vec<_> = [Quality::Low, Quality::Medium, Quality::High, Quality::Ultra].map(GraphicsProfile::of).into();
+        assert!(profiles[0].shadows.is_none() && profiles[0].msaa == 1);
+        for w in profiles.windows(2) {
+            assert!(w[1].tree_detail >= w[0].tree_detail);
+            assert!(w[1].reduced_tree_detail >= w[0].reduced_tree_detail);
+            let cascades = |p: &GraphicsProfile| p.shadows.map_or(0, |s| s.cascades);
+            assert!(cascades(&w[1]) >= cascades(&w[0]));
+        }
+        for q in Quality::ALL {
+            assert_eq!(Quality::from_name(q.name()), Some(q));
+        }
+    }
+
+    #[test]
     fn settings_round_trip_and_survive_garbage() {
         let dir = temp_dir("settings");
         let path = dir.join("settings.cfg");
         assert_eq!(Settings::load(&path), Settings::default());
-        let custom = Settings { fullscreen: true, shadows: false, ui_scale_percent: 115, language: "en".into() };
+        let custom = Settings { fullscreen: true, quality: Quality::Medium, ui_scale_percent: 115, language: "en".into() };
         custom.save(&path).unwrap();
         assert_eq!(Settings::load(&path), custom);
-        std::fs::write(&path, "ui_scale = 9999\nnonsense\nshadows = maybe\n").unwrap();
+        std::fs::write(&path, "ui_scale = 9999\nnonsense\nquality = maybe\n").unwrap();
         let read = Settings::load(&path);
         assert_eq!(read.ui_scale_percent, 130);
-        assert!(read.shadows);
+        assert_eq!(read.quality, Quality::Auto);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

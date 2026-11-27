@@ -25,7 +25,8 @@ use sim_core::SaveGame;
 
 use crate::hud::{self, HudFont};
 use crate::session::{self, Session, Settings, UI_SCALES};
-use crate::viewer::{Sim, Texts};
+use crate::viewer::{Graphics, Sim, Texts};
+use bevy::render::renderer::RenderAdapterInfo;
 
 const MENU_ART: &[u8] = include_bytes!("../assets/menu/menu.jpg");
 const LOADING_ART: &[u8] = include_bytes!("../assets/menu/chargement.jpg");
@@ -120,7 +121,9 @@ enum MenuAction {
     SettingsPage,
     Quit,
     ToggleFullscreen,
-    ToggleShadows,
+    CycleQuality,
+    /// Ligne d'information (sans effet au clic).
+    Info,
     CycleUiScale,
     CycleLanguage,
     Resume,
@@ -223,7 +226,10 @@ impl Plugin for ScreensPlugin {
                 Update,
                 (pause_menu, menu_hover, menu_clicks).chain().run_if(in_state(AppState::InGame)),
             )
-            .add_systems(Update, apply_settings.run_if(resource_changed::<PlayerSettings>));
+            .add_systems(Update, apply_settings.run_if(resource_changed::<PlayerSettings>))
+            // Avant `apply_graphics` et `setup` : le bon préréglage dès la
+            // première image de la partie.
+            .add_systems(PreUpdate, update_graphics);
         if let Some(request) = &self.request {
             app.insert_resource(request.clone());
         }
@@ -260,7 +266,22 @@ fn load_assets(
     commands.insert_resource(MenuArt { menu: images.add(decode(MENU_ART)), loading: images.add(decode(LOADING_ART)) });
 }
 
-fn apply_settings(settings: Res<PlayerSettings>, mut windows: Query<&mut Window>, mut scale: ResMut<UiScale>, mut lights: Query<&mut DirectionalLight>) {
+/// La carte graphique en service est-elle une puce intégrée (ou un rendu
+/// logiciel) ? C'est ce qui oriente le préréglage `Auto`.
+fn integrated_gpu(adapter: Option<&RenderAdapterInfo>) -> bool {
+    // `wgpu::DeviceType` n'est pas réexporté par Bevy : on compare son nom.
+    adapter.is_some_and(|a| matches!(format!("{:?}", a.device_type).as_str(), "IntegratedGpu" | "Cpu"))
+}
+
+/// Préréglage graphique effectif : réglage du joueur + carte détectée.
+fn update_graphics(settings: Res<PlayerSettings>, adapter: Option<Res<RenderAdapterInfo>>, mut graphics: ResMut<Graphics>) {
+    let quality = settings.0.quality.resolve(integrated_gpu(adapter.as_deref()));
+    if graphics.0.quality != quality {
+        graphics.0 = session::GraphicsProfile::of(quality);
+    }
+}
+
+fn apply_settings(settings: Res<PlayerSettings>, mut windows: Query<&mut Window>, mut scale: ResMut<UiScale>) {
     let s = &settings.0;
     for mut window in &mut windows {
         let mode = if s.fullscreen { WindowMode::BorderlessFullscreen(MonitorSelection::Current) } else { WindowMode::Windowed };
@@ -269,9 +290,6 @@ fn apply_settings(settings: Res<PlayerSettings>, mut windows: Query<&mut Window>
         }
     }
     scale.0 = f32::from(s.ui_scale_percent) / 100.0;
-    for mut light in &mut lights {
-        light.shadow_maps_enabled = s.shadows;
-    }
     let _ = s.save(&Settings::path());
 }
 
@@ -523,6 +541,7 @@ fn rebuild_page(
     saves: Res<SaveList>,
     ui_font: Res<HudFont>,
     texts: Res<Texts>,
+    adapter: Option<Res<RenderAdapterInfo>>,
     mut panels: Query<(Entity, &mut Node), With<PagePanel>>,
 ) {
     if !page.is_changed() && !settings.is_changed() {
@@ -551,11 +570,22 @@ fn rebuild_page(
             let s = &settings.0;
             let on_off = |v: bool| if v { t("settings-on") } else { t("settings-off") };
             p.spawn((Text::new(t("settings-title")), font(&ui_font, 28.0, 700), TextColor(TEXT), Node { margin: UiRect::bottom(Val::Px(12.0)), ..default() }));
+            let integrated = integrated_gpu(adapter.as_deref());
+            let quality = match s.quality {
+                session::Quality::Auto => texts.format(
+                    "quality-auto",
+                    &[("resolved", Arg::from(t(&format!("quality-{}", s.quality.resolve(integrated).name()))))],
+                ),
+                q => t(&format!("quality-{}", q.name())),
+            };
+            let gpu_name = adapter.as_ref().map_or_else(String::new, |a| a.name.clone());
+            let gpu = if integrated { texts.format("settings-gpu-integrated", &[("name", Arg::from(gpu_name))]) } else { gpu_name };
             let rows = [
+                (t("settings-quality"), quality, MenuAction::CycleQuality),
                 (t("settings-fullscreen"), on_off(s.fullscreen), MenuAction::ToggleFullscreen),
-                (t("settings-shadows"), on_off(s.shadows), MenuAction::ToggleShadows),
                 (t("settings-ui-scale"), texts.format("settings-percent", &[("value", Arg::from(s.ui_scale_percent))]), MenuAction::CycleUiScale),
                 (t("settings-language"), t(&format!("language-{}", s.language)), MenuAction::CycleLanguage),
+                (t("settings-gpu"), gpu, MenuAction::Info),
             ];
             for (label, value, action) in rows {
                 menu_button(p, &ui_font, label, Some(value), action, 20.0);
@@ -629,7 +659,12 @@ fn menu_clicks(
             exit.write(AppExit::Success);
         }
         MenuAction::ToggleFullscreen => settings.0.fullscreen = !settings.0.fullscreen,
-        MenuAction::ToggleShadows => settings.0.shadows = !settings.0.shadows,
+        MenuAction::CycleQuality => {
+            let all = session::Quality::ALL;
+            let i = all.iter().position(|q| *q == settings.0.quality).unwrap_or(0);
+            settings.0.quality = all[(i + 1) % all.len()];
+        }
+        MenuAction::Info => {}
         MenuAction::CycleUiScale => {
             let i = UI_SCALES.iter().position(|v| *v == settings.0.ui_scale_percent).unwrap_or(1);
             settings.0.ui_scale_percent = UI_SCALES[(i + 1) % UI_SCALES.len()];
