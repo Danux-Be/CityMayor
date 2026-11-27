@@ -46,10 +46,10 @@ use sim_core::{FixedStepClock, World, ZoneType};
 
 use std::collections::HashMap;
 
-use crate::{hud, nature, roads, scene, urban};
+use crate::{hud, nature, roads, scene, screens, urban};
 
 /// Ticks simulés avant d'ouvrir la fenêtre : la ville est déjà peuplée.
-const PRESIMULATION_TICKS: u32 = 2_400;
+const PRESIMULATION_TICKS: u64 = crate::session::NEW_GAME_TICKS;
 
 type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
 type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
@@ -104,24 +104,20 @@ impl MaterialExtension for UrbanExtension {
 }
 
 /// Lancée par le binaire `city-viewer`.
+///
+/// Déroulé : écran du studio → menu principal → chargement → partie
+/// (`screens`). Les tours de captures (`CITYMAYOR_TOUR`) et le test des
+/// outils (`CITYMAYOR_TOOLTEST`) vont droit au chargement.
 pub fn run() {
-    // Test des outils : un petit pâté de maisons suffit (démarrage rapide,
-    // pas une carte entière de chantiers).
     let tool_test = std::env::var_os("CITYMAYOR_TOOLTEST").is_some();
-    let mut world = if tool_test { scene::small_block() } else { scene::demo_city() };
-    let presimulation = if tool_test { 1_500 } else { PRESIMULATION_TICKS };
-    for tick in 0..presimulation {
-        if tool_test {
-            world.tick();
-            continue;
-        }
-        // À mi-parcours : un chantier d'autoroute, encore en cours à l'ouverture.
-        if tick == PRESIMULATION_TICKS / 2 {
-            scene::demo_road_works(&mut world);
-        }
-        world.tick();
-    }
-    let tour = Tour::new(std::env::var_os("CITYMAYOR_TOUR").is_some(), &world);
+    let tour = std::env::var_os("CITYMAYOR_TOUR").is_some();
+    let (start, request) = if tool_test {
+        (screens::AppState::Loading, Some(screens::LoadRequest::New { scenario: "block".into(), ticks: 1_500 }))
+    } else if tour {
+        (screens::AppState::Loading, Some(screens::LoadRequest::New { scenario: "demo".into(), ticks: PRESIMULATION_TICKS }))
+    } else {
+        (screens::AppState::Splash, None)
+    };
 
     // Langue de l'interface : anglais pour l'instant (fichiers `locales/`).
     let texts = city_i18n::Localizer::english();
@@ -137,20 +133,20 @@ pub fn run() {
     embedded_asset!(app, "shaders/terrain.wesl");
     embedded_asset!(app, "shaders/water.wesl");
     embedded_asset!(app, "shaders/urban.wesl");
-    app.add_plugins((
+    app.insert_resource(Texts(texts)).add_plugins((
         MaterialPlugin::<TerrainMaterial>::default(),
         MaterialPlugin::<WaterMaterial>::default(),
         MaterialPlugin::<UrbanMaterial>::default(),
+        screens::ScreensPlugin { start, request },
         hud::HudPlugin,
     ))
-    .insert_resource(ClearColor(srgb(nature::HORIZON_COLOR)))
-    .insert_resource(Sim::new(world))
-    .insert_resource(Texts(texts))
+    .insert_resource(ClearColor(Color::BLACK))
     .insert_resource(Handles::default())
     .insert_resource(City::default())
-    .insert_resource(tour)
+    .insert_resource(Tour::inactive())
     // `ScreenshotPlugin` est déjà fourni par `DefaultPlugins` en Bevy 0.20.
-    .add_systems(Startup, setup)
+    // La scène se construit à la fin du chargement (`screens::BuildScene`).
+    .add_systems(Update, setup.run_if(resource_exists::<screens::BuildScene>))
     .add_systems(
         Update,
         (
@@ -163,9 +159,19 @@ pub fn run() {
             stream_forest,
             (auto_screenshot, screenshot_on_key).chain(),
         )
-            .chain(),
+            .chain()
+            .run_if(in_state(screens::AppState::InGame)),
     )
     .run();
+}
+
+/// Ressources de la partie remises à neuf au retour au menu principal.
+pub(crate) fn reset_game_resources(commands: &mut Commands) {
+    commands.insert_resource(Handles::default());
+    commands.insert_resource(City::default());
+    commands.insert_resource(Tour::inactive());
+    commands.remove_resource::<Forest>();
+    commands.insert_resource(ClearColor(Color::BLACK));
 }
 
 /// Diagnostic de performance : `CITYMAYOR_DISABLE=arbres,ombres,eau,sol,msaa`
@@ -201,7 +207,7 @@ pub(crate) struct Sim {
 }
 
 impl Sim {
-    fn new(world: World) -> Self {
+    pub(crate) fn new(world: World) -> Self {
         Self {
             world,
             clock: FixedStepClock::from_hz(20),
@@ -631,6 +637,9 @@ fn setup(
     mut handles: ResMut<Handles>,
     mut city: ResMut<City>,
 ) {
+    // Un seul passage, à la fin de l'écran de chargement.
+    commands.remove_resource::<screens::BuildScene>();
+    commands.insert_resource(ClearColor(srgb(nature::HORIZON_COLOR)));
     let world = &sim.world;
     let static_usage = RenderAssetUsages::RENDER_WORLD;
 
@@ -1129,8 +1138,8 @@ fn tree_mesh(chunk: nature::TreeChunk) -> Mesh {
 
 /// Tour de vérification : une suite de points de vue capturés puis on quitte.
 #[derive(Resource)]
-struct Tour {
-    active: bool,
+pub(crate) struct Tour {
+    pub(crate) active: bool,
     step: usize,
     elapsed: f32,
     shot_taken: bool,
@@ -1152,7 +1161,11 @@ const LANDMARK_VIEWS: [(&str, f32, f32, f32); 5] = [
 ];
 
 impl Tour {
-    fn new(active: bool, world: &World) -> Self {
+    fn inactive() -> Self {
+        Self { active: false, step: 0, elapsed: 0.0, shot_taken: false, frames: 0, frame_time: 0.0, views: Vec::new() }
+    }
+
+    pub(crate) fn new(active: bool, world: &World) -> Self {
         let (w, h) = nature::play_size_m(world);
         let mut views: Vec<_> = TOUR_VIEWS
             .iter()

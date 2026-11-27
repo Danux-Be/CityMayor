@@ -24,4 +24,4 @@
 | 6 | Rendu commercial | textures 2K avec normales et rugosité en jeu, plus de modèles de bâtiments par niveau de richesse, nuit et fenêtres éclairées, eau réfléchissante, occlusion ambiante | à faire |
 | 7 | Trafic | A* déterministe, véhicules animés, feux et priorités, overlay de trafic | à faire |
 | 8 | Services et économie | électricité, eau, police, santé, éducation, pollution, niveaux de bâtiments, budget détaillé | à faire |
-| 9 | Production | sauvegarde/chargement, options (langue, graphismes), menus, sons | à faire |
+| 9 | Production | sauvegarde/chargement, options (langue, graphismes), menus, sons | en partie : écran du studio, menu principal, chargement, menu pause, sauvegardes par rejeu du journal et réglages faits ; sons et sauvegarde par instantané à venir |

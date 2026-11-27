@@ -200,7 +200,7 @@ const DEMO_HIGHWAY_WORKS_TILES: u32 = 36;
 /// Ouvre le chantier de la démo : le dernier tronçon de l'autoroute, avec
 /// la durée de travaux normale (la route ouvrira en cours de partie).
 pub fn demo_road_works(world: &mut World) {
-    world.set_road_construction(true);
+    world.queue(Command::SetRoadConstruction { enabled: true });
     let hy = DEMO_HIGHWAY_ROW;
     let at = |x: u32| Point::new(tile_center_m(x as i32), tile_center_m(hy as i32));
     // Extrémité est actuelle de l'autoroute : le nœud le plus à l'est sur sa rangée.

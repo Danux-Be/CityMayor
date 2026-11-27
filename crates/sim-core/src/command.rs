@@ -114,6 +114,9 @@ pub enum Command {
     /// Taux d'imposition (%) des habitants et des entreprises, bornés à
     /// `economy::MAX_TAX_PERCENT`.
     SetTaxes { residential_percent: u8, business_percent: u8 },
+    /// Active ou coupe les chantiers routiers pour les routes tracées
+    /// ensuite (scénarios : réseau initial livré ouvert, puis chantiers).
+    SetRoadConstruction { enabled: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

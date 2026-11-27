@@ -235,6 +235,8 @@ pub struct World {
     road_access_dirty: bool,
     /// Prochaine fin de chantier routier (évite un balayage par tick).
     next_road_opening: Option<Tick>,
+    /// Journal des commandes `(tick, commande)` : sauvegarde par rejeu.
+    journal: Vec<(u64, Command)>,
 
     buildings: Buildings,
     land_value: LandValueLayer,
@@ -310,6 +312,7 @@ impl World {
             road_access,
             road_access_dirty: false,
             next_road_opening: None,
+            journal: Vec::new(),
             buildings,
             land_value,
             census,
@@ -426,8 +429,18 @@ impl World {
     // ------------------------------------------------------------ commandes
 
     /// Met une commande en file. Elle sera appliquée au **prochain** tick.
+    ///
+    /// Chaque commande est aussi inscrite au journal (avec le tick courant) :
+    /// c'est ce qui permet de sauvegarder la partie et de la rejouer.
     pub fn queue(&mut self, command: Command) {
+        self.journal.push((self.tick.raw(), command.clone()));
         self.commands.push_back(command);
+    }
+
+    /// Commandes reçues depuis la création du monde, avec leur tick.
+    #[must_use]
+    pub fn journal(&self) -> &[(u64, Command)] {
+        &self.journal
     }
 
     // ------------------------------------------------------------ pipeline
@@ -535,6 +548,7 @@ impl World {
                 Command::BuildRoundabout { center, radius_m, spec } => {
                     self.build_roundabout(center, radius_m, spec);
                 }
+                Command::SetRoadConstruction { enabled } => self.config.road_construction = enabled,
                 Command::SetTaxes { residential_percent, business_percent } => {
                     self.treasury.set_tax_percent(residential_percent, business_percent);
                 }

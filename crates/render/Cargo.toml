@@ -33,6 +33,7 @@ bevy = { version = "0.20.1", optional = true, default-features = false, features
     "bevy_ui",
     "bevy_ui_render",
     "bevy_text",
+    "bevy_state",
     "bevy_winit",
     "multi_threaded",
     "png",

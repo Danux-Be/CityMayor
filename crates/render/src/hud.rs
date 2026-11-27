@@ -30,7 +30,7 @@ use crate::viewer::{urban_mesh_public, Sim, Texts};
 use crate::{roads, urban};
 
 /// Police de l'interface (Inter, OFL — `assets/fonts`).
-const FONT_TTF: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
+pub(crate) const FONT_TTF: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
 
 const PANEL: Color = Color::srgba(0.06, 0.08, 0.11, 0.86);
 const BUTTON: Color = Color::srgba(0.15, 0.18, 0.23, 0.95);
@@ -52,7 +52,7 @@ impl Plugin for HudPlugin {
             return;
         }
         app
-            .add_systems(Startup, setup_hud)
+            .add_systems(OnEnter(crate::screens::AppState::InGame), setup_hud)
             .add_systems(
                 Update,
                 (
@@ -68,7 +68,8 @@ impl Plugin for HudPlugin {
                     update_panels,
                     update_overlay,
                 )
-                    .chain(),
+                    .chain()
+                    .run_if(in_state(crate::screens::AppState::InGame)),
             );
     }
 }
@@ -191,7 +192,7 @@ struct HudButton {
 
 /// Panneau qui intercepte la souris.
 #[derive(Component)]
-struct Blocker;
+pub(crate) struct Blocker;
 
 #[derive(Component)]
 struct SubPanel(Category);
@@ -215,8 +216,9 @@ struct FeedLine(usize);
 #[derive(Component)]
 struct GhostMesh;
 
-#[derive(Resource)]
-struct HudFont(Handle<Font>);
+/// Police de l'interface, chargée au démarrage (`screens`).
+#[derive(Resource, Debug)]
+pub(crate) struct HudFont(pub(crate) Handle<Font>);
 
 #[derive(Resource)]
 struct GhostMaterials {
@@ -252,12 +254,12 @@ fn ghost_material(materials: &mut Assets<StandardMaterial>, rgb: [f32; 3]) -> Ha
 #[allow(clippy::too_many_lines)]
 fn setup_hud(
     mut commands: Commands,
-    mut fonts: ResMut<Assets<Font>>,
+    hud_font: Res<HudFont>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     texts: Res<Texts>,
 ) {
-    let hud_font = HudFont(fonts.add(Font::from_bytes(FONT_TTF.to_vec())));
+    let hud_font = HudFont(hud_font.0.clone());
     let t = |key: &str| texts.text(key);
 
     // --- fantômes de construction
@@ -566,7 +568,7 @@ fn setup_hud(
         Visibility::Hidden,
         NoFrustumCulling,
     ));
-    commands.insert_resource(hud_font);
+    drop(hud_font);
 }
 
 /// Panneau à titre et lignes « libellé — valeur » (+ contenu propre).
@@ -759,7 +761,22 @@ fn hud_buttons(
     }
 }
 
-fn hud_keys(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>, mut tools: ResMut<Tools>) {
+fn hud_keys(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>, mut tools: ResMut<Tools>, mut pause: ResMut<crate::screens::PauseMenu>) {
+    // Échap : d'abord annuler le geste, l'outil, le sous-menu ; sinon pause.
+    if keys.just_pressed(KeyCode::Escape) {
+        let busy = pause.open || tools.controller.tool != Tool::Select || tools.open.is_some() || tools.selected.is_some();
+        if pause.open || !busy {
+            pause.toggle_requested = true;
+            return;
+        }
+        if tools.selected.is_some() && tools.controller.tool == Tool::Select && tools.open.is_none() {
+            tools.selected = None;
+            return;
+        }
+    }
+    if pause.open {
+        return;
+    }
     if keys.just_pressed(KeyCode::Space) {
         sim.speed = if sim.speed == 0 { sim.resume_speed.max(1) } else { 0 };
     }
